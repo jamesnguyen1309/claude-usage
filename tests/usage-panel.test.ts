@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { importNote } from '../hooks/context'
+
 const PANE = { plugin: 'usage-panel', component: 'Pane', requestId: 'usage-panel' } as const
 const paneProps = { title: 'Usage', isFocused: false, bodyColumns: 100, placement: 'dock' } as never
 const BAND = { plugin: 'usage-panel', component: 'AbovePrompt', requestId: 'above-prompt' } as const
@@ -234,4 +236,59 @@ test('the burn rate reads each window’s pace and forecasts where it ends', asy
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
   expect((await svgProps(desk, /^7-day limit: /))?.alt).toMatch(/measuring…/)
   await desk.unmount()
+})
+
+test('the context section exports the conversation and imports an export back in', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-18T09:41:00Z') })
+  mock.store(on)
+  mock.env(on, { HOME: '/home/me' })
+  const session = mock.session(on)
+  // A small disk, and the session beneath the plugin.
+  const disk = new Map<string, { text: string; mtimeMs: number }>()
+  const value = <T,>(v: T) => ({ value: v }) as never
+  on('fs.write', async (_$, e) => (disk.set(e.path, { text: e.text, mtimeMs: disk.size + 1 }), value(undefined)))
+  on('fs.read', async (_$, e) => value(disk.get(e.path)?.text ?? ''))
+  on('fs.exists', async (_$, e) => value([...disk.keys()].some(k => k === e.path || k.startsWith(`${e.path}/`))))
+  on('fs.list', async (_$, e) =>
+    value([...disk].filter(([k]) => k.startsWith(`${e.path}/`)).map(([k, v]) => ({ name: k.slice(e.path.length + 1), kind: 'file', size: v.text.length, mtimeMs: v.mtimeMs, isLink: false }))),
+  )
+  on('session.root', async () => value('/work/my-app'))
+  on('session.id', async () => value('sess-1'))
+  on('session.model', async () => value('claude-opus-5-5'))
+  on('session.usage', async () => value({ startedAt: 0, context: { tokens: 20_000, window: 200_000, percent: 10 }, rateLimits: [] }))
+  on('session.messages', async () =>
+    value([
+      { role: 'user', text: 'Add a login page', toolUses: [] },
+      { role: 'assistant', text: 'Reading the router first.', toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: 'src/routes.ts' }, text: 'export const routes = []' }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'export const routes = []' }] },
+      { role: 'assistant', text: 'Done: /login added.', toolUses: [] },
+    ]),
+  )
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
+  expect(await ui.find({ type: 'Text', text: /^No exports yet/ })).toBeDefined()
+
+  await ui.press({ key: 'context-export' })
+  const [path, file] = [...disk][0] ?? []
+  expect(path).toBe('/home/me/.claude/context-exports/work-my-app/context-2026-10-18T09-41-00Z.md')
+  expect(file?.text).toMatch(/^# Context export\n/)
+  expect(file?.text).toMatch(/## User\n\nAdd a login page\n\n## Claude\n\nReading the router first\.\n\n\*\*Tool: Read\*\*\n\n```\n\{\n  "file_path": "src\/routes\.ts"\n\}\n```\n\nResult:\n\n```\nexport const routes = \[\]\n```\n\n## Claude\n\nDone: \/login added\./)
+  expect(await ui.find({ type: 'Text', text: /^Exported 4 messages, ≈\d+ tokens, to \/home\/me\// })).toBeDefined()
+
+  await ui.press({ key: 'import:context-2026-10-18T09-41-00Z.md' })
+  const rows = session.appended()
+  const note = rows.at(-1)?.message.content[0] as { type: string; text: string } | undefined
+  expect(note?.text).toMatch(/^<imported-context source="context-2026-10-18T09-41-00Z\.md">\n/)
+  expect(note?.text).toMatch(/Done: \/login added\.\n<\/imported-context>$/)
+  expect(await ui.find({ type: 'Text', text: /^Imported context-2026-10-18T09-41-00Z\.md, ≈\d+ tokens\. Claude reads it with your next prompt\.$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an import too big for the context window keeps its newest part', async () => {
+  const file = ['# Context export', '', '## User', '', 'old '.repeat(4000), '## Claude', '', 'newest answer'].join('\n')
+  const note = importNote(file, 'x.md', 1000)
+  expect(note.isCut).toBe(true)
+  expect(note.text).toMatch(/truncated=/)
+  expect(note.text).toMatch(/## Claude\n\nnewest answer/)
+  expect(note.text).not.toMatch(/^## User/m)
 })
