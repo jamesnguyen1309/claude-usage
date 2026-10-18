@@ -244,8 +244,10 @@ test('the prompt list keeps a fixed height and scrolls inside, by wheel or ▲ �
   await ui.unmount()
 })
 
-test('the conversation counter adds up every prompt, model call, tool call and token', async ($, on) => {
-  mock.clock(on)
+test('the statistics show when tokens reload and every model and tool call', async ($, on) => {
+  const start = Date.parse('2026-10-18T10:00:00Z')
+  mock.clock(on, { now: start })
+  on('session.measure', async () => ({ changed: [] }) as never)
   on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
   on('agent.spawn', async () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
   // Main-loop calls ask for one tool each; the subagent's ask for none.
@@ -272,6 +274,15 @@ test('the conversation counter adds up every prompt, model call, tool call and t
   const send = (uuid: string, text: string) =>
     $.session.append({ uuid, door: 'prompt', origin: COMPOSER, message: { type: 'user', role: 'user', content: [{ type: 'text', text }] } } as never)
 
+  await $.session.measure({
+    context: { tokens: 50_000, window: 200_000, percent: 25 },
+    rateLimits: [
+      { kind: 'seven_day', percentUsed: 40, resetsAt: '2026-10-22T09:00:00Z' },
+      { kind: 'five_hour', percentUsed: 62, resetsAt: '2026-10-18T12:14:00Z' },
+    ],
+    cost: { usd: 1.25 },
+  } as never)
+
   await send('u1', 'First prompt')
   await $.turn.start({ text: 'First prompt', turnId: 't1' })
   await step({ turnId: 't1', index: 0, model: 'claude-opus-5-5' })
@@ -282,14 +293,21 @@ test('the conversation counter adds up every prompt, model call, tool call and t
   await $.turn.start({ text: 'Second prompt', turnId: 't2' })
   await step({ turnId: 't2', index: 0, model: 'claude-opus-5-5' })
 
-  // 2 prompts; 2 main calls + 2 subagent calls; a tool per main call; 2 × 21,500 + 2 × 150 tokens.
+  // The 5-hour window resets first: 2h 14m away. 2 main calls + 2 subagent calls; a tool per main call.
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
-  const card = await svgProps(desk, /^This conversation: /)
-  expect(card?.alt).toBe(
-    'This conversation: 2 prompts sent, 4 model calls, 2 tool calls, 43k tokens (in 2k, out 1k, cache read 40k, cache write 0)',
-  )
+  const tiles = await svgProps(desk, /^Tokens reload in /)
+  expect(tiles?.alt).toMatch(/^Tokens reload in 2h 14m \(5-hour · \d\d:\d\d\), Model calls 4, Tool calls 2, Prompts sent 2, Session cost \$1\.25/)
+  expect(tiles?.alt).toMatch(/7-day limit 40% \(resets \w{3} \d\d:\d\d\)/)
+  // The conversation card is gone, and the prompt card shows figures, not a bar.
+  expect(await svgProps(desk, /^This conversation: /)).toBeUndefined()
+  const card = await svgProps(desk, /^Working on: Second prompt/)
+  expect(card?.source).not.toMatch(/clip-path/)
+  expect(card?.source).toMatch(/cache hit/)
   await desk.unmount()
+
   const term = await $.ui.mount({ ...PANE, surface: 'terminal', props: paneProps })
-  expect(await term.find({ type: 'Text', text: /^  2 prompts · 4 model calls · 2 tool calls · 43k tokens$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^  Tokens reload in 2h 14m · 5-hour limit · \d\d:\d\d$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /^  4 model calls · 2 tool calls · 2 prompts$/ })).toBeDefined()
+  expect(await term.find({ type: 'Text', text: /This conversation/ })).toBeUndefined()
   await term.unmount()
 })

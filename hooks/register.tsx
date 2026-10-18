@@ -5,13 +5,17 @@ import type { AgentRun, ConversationTotals, ModelUse, PromptRow, PromptRun, RunS
 import {
   agentRow,
   bandRow,
-  conversationCard,
+  cacheHit,
   crabDoneIcon,
   crabIcon,
+  fmtResetAt,
   fmtTime,
   fmtTokens,
+  fmtUntil,
   fmtUsd,
+  limitName,
   modelName,
+  nextReset,
   PARTS,
   modelColor,
   promptCard,
@@ -196,15 +200,19 @@ export const register: Register = on => {
     try {
       const usage = await $.session.usage()
       await update($, session, () => figures(usage))
+      const at = await $.clock.now()
+      await update($, now, () => at)
     } catch {
       // No figures yet: the first session.measure fills them.
     }
-    // Once a second: saves rows seen drawn, and ticks running clocks (quiet when nothing runs).
+    // Once a second: saves rows seen drawn, and ticks running clocks; when nothing runs, once a
+    // minute, for the reload countdown.
     $.clock.every(1000, () => {
       void (async () => {
         await saveDrawn($)
-        if (!(await read($, prompts)).some(p => p.status === 'running' || p.agents.some(a => a.status === 'running'))) return
         const at = await $.clock.now()
+        const isRunning = (await read($, prompts)).some(p => p.status === 'running' || p.agents.some(a => a.status === 'running'))
+        if (!isRunning && Math.floor(at / 60_000) === Math.floor((await read($, now)) / 60_000)) return
         await update($, now, () => at)
       })()
     })
@@ -547,8 +555,7 @@ export const register: Register = on => {
     if (e.surface !== 'terminal' && 'Svg' in ui) {
       const { Svg } = ui
       const W = Math.max(260, Math.min(900, (e.props.bodyColumns || 48) * 8 - 8))
-      const tiles = sessionTiles(W, s)
-      const conv = conversationCard(W, promptRows.length, convo)
+      const tiles = sessionTiles(W, s, { now: at, prompts: promptRows.length, calls: convo })
       const card = focus
         ? promptCard(W, focus, promptTokens(focus), {
             costUsd: costOf(focus),
@@ -560,7 +567,6 @@ export const register: Register = on => {
       return (
         <Box flexDirection="column" gap={1}>
           <Svg key="tiles" source={tiles.source} alt={tiles.alt} width={W} height={tiles.height} />
-          <Svg key="conversation" source={conv.source} alt={conv.alt} width={W} height={conv.height} />
           {card ? (
             <Svg key="prompt" source={card.source} alt={card.alt} width={W} height={card.height} />
           ) : (
@@ -596,10 +602,30 @@ export const register: Register = on => {
     const barW = Math.max(8, Math.min(24, cols - 30))
     const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
     const t = focus ? promptTokens(focus) : zero()
+    const reload = nextReset(s, at)
+    const resetOf = (iso?: string) => {
+      const ms = iso ? Date.parse(iso) : NaN
+      return Number.isFinite(ms) ? ` · resets ${fmtResetAt(ms, at)}` : ''
+    }
+    const hit = cacheHit(t)
 
     return (
       <Box flexDirection="column">
-        <Text bold>Session</Text>
+        <Text bold>Statistics</Text>
+        {reload && (
+          <Text wrap="truncate-end">
+            {'  '}Tokens reload in <Text bold color="claude">{fmtUntil(reload.at - at)}</Text>
+            <Text dimColor>
+              {' '}
+              · {limitName(reload.kind)} · {fmtResetAt(reload.at, at)}
+            </Text>
+          </Text>
+        )}
+        <Text wrap="truncate-end">
+          {'  '}
+          <Text bold>{convo.modelCalls}</Text> model calls · <Text bold>{convo.toolCalls}</Text> tool calls ·{' '}
+          <Text bold>{promptRows.length}</Text> prompts
+        </Text>
         <Text>
           {'  '}Cost <Text bold>{fmtUsd(s.costUsd)}</Text>
         </Text>
@@ -613,21 +639,9 @@ export const register: Register = on => {
           <Text key={r.kind} wrap="truncate-end">
             {'  '}
             {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text color={pctColor(r.percentUsed)}>{bar(r.percentUsed, barW)}</Text> {Math.round(r.percentUsed)}%
+            <Text dimColor>{resetOf(r.resetsAt)}</Text>
           </Text>
         ))}
-
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>This conversation</Text>
-          <Text wrap="truncate-end">
-            {'  '}
-            <Text bold>{promptRows.length}</Text> prompts · <Text bold>{convo.modelCalls}</Text> model calls ·{' '}
-            <Text bold>{convo.toolCalls}</Text> tool calls · <Text bold>{fmtTokens(total(convo.tokens))}</Text> tokens
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {'  '}
-            {PARTS.map(p => `${p.label} ${fmtTokens(convo.tokens[p.key])}`).join(' · ')}
-          </Text>
-        </Box>
 
         <Box marginTop={1} flexDirection="column">
           <Text bold>This prompt</Text>
@@ -642,6 +656,9 @@ export const register: Register = on => {
               <Text wrap="truncate-end">
                 {'  '}Tokens <Text bold>{fmtTokens(total(t))}</Text>
                 <Text dimColor> · {PARTS.map(p => `${p.label} ${fmtTokens(t[p.key])}`).join(' · ')}</Text>
+              </Text>
+              <Text dimColor wrap="truncate-end">
+                {'  '}cache hit {hit === undefined ? '—' : `${Math.round(hit)}%`} · {calls(focus) ? fmtTokens(total(t) / calls(focus)) : '—'} per call
               </Text>
               <Text>{'  '}Models</Text>
               {focus.models.length ? (

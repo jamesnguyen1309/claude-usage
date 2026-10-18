@@ -185,10 +185,59 @@ const pill = (x: number, y: number, label: string, color: string, size = 11): { 
 
 // ---- pane: session tiles ------------------------------------------------------------
 
-export function sessionTiles(W: number, s: SessionFigures): { source: string; height: number; alt: string } {
-  type Tile = { label: string; value: string; sub?: string; pct?: number }
+// How long until a moment: 45m, 2h 14m, 3d 4h; "now" once it has passed.
+export const fmtUntil = (ms: number): string => {
+  const m = Math.ceil(ms / 60_000)
+  if (m <= 0) return 'now'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ${String(m % 60).padStart(2, '0')}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+// When a window resets: 16:30 today, Thu 09:00 on another day.
+export const fmtResetAt = (ms: number, now: number): string => {
+  const d = new Date(ms)
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+  return d.toDateString() === new Date(now).toDateString() ? time : `${d.toLocaleDateString([], { weekday: 'short' })} ${time}`
+}
+
+/** The rate-limit window that resets soonest, still ahead of `now`. */
+export const nextReset = (s: SessionFigures, now: number): { kind: string; at: number } | undefined =>
+  s.rateLimits
+    .map(r => ({ kind: r.kind, at: r.resetsAt ? Date.parse(r.resetsAt) : NaN }))
+    .filter(r => Number.isFinite(r.at) && r.at > now)
+    .sort((a, b) => a.at - b.at)[0]
+
+export const limitName = (kind: string): string => LIMIT_NAME[kind] ?? kind
+
+/**
+ * The statistics: when tokens next reload, the conversation's model and tool calls and prompts,
+ * then cost, context and each rate limit with its own reset.
+ */
+export function sessionTiles(
+  W: number,
+  s: SessionFigures,
+  o: { now: number; prompts: number; calls: ConversationTotals },
+): { source: string; height: number; alt: string } {
+  type Tile = { label: string; value: string; sub?: string; pct?: number; accent?: string }
   const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
-  const tiles: Tile[] = [{ label: 'Session cost', value: fmtUsd(s.costUsd) }]
+  const tiles: Tile[] = []
+  const next = nextReset(s, o.now)
+  if (next) {
+    tiles.push({
+      label: 'Tokens reload in',
+      value: fmtUntil(next.at - o.now),
+      sub: `${limitName(next.kind).replace(/ limit$/, '')} · ${fmtResetAt(next.at, o.now)}`,
+      accent: CLAY,
+    })
+  }
+  tiles.push(
+    { label: 'Model calls', value: String(o.calls.modelCalls) },
+    { label: 'Tool calls', value: String(o.calls.toolCalls) },
+    { label: 'Prompts sent', value: String(o.prompts) },
+    { label: 'Session cost', value: fmtUsd(s.costUsd) },
+  )
   if (ctxPct !== undefined) {
     tiles.push({
       label: 'Context',
@@ -198,8 +247,9 @@ export function sessionTiles(W: number, s: SessionFigures): { source: string; he
     })
   }
   for (const r of s.rateLimits) {
-    const resets = r.resetsAt ? new Date(r.resetsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
-    tiles.push({ label: LIMIT_NAME[r.kind] ?? r.kind, value: `${Math.round(r.percentUsed)}%`, sub: resets && `resets ${resets}`, pct: r.percentUsed })
+    const at = r.resetsAt ? Date.parse(r.resetsAt) : NaN
+    const sub = Number.isFinite(at) ? `resets ${fmtResetAt(at, o.now)}` : undefined
+    tiles.push({ label: limitName(r.kind), value: `${Math.round(r.percentUsed)}%`, sub, pct: r.percentUsed })
   }
 
   const gap = 8
@@ -214,14 +264,16 @@ export function sessionTiles(W: number, s: SessionFigures): { source: string; he
       return (
         `<rect class="card" x="${x + 0.5}" y="${y + 0.5}" width="${tw - 1}" height="${th - 1}" rx="10"/>` +
         text(x + 12, y + 20, t.label, { size: 11, cls: 'mu' }) +
-        text(x + 12, y + 42, t.value, { size: 19, weight: 650 }) +
-        (t.sub ? text(x + tw - 12, y + 42, fitText(t.sub, 10.5, tw - 36 - textWidth(t.value, 19, false, true)), { size: 10.5, cls: 'su', anchor: 'end' }) : '') +
+        text(x + 12, y + 42, t.value, { size: 19, weight: 650, fill: t.accent }) +
+        // Without a meter, the note takes the meter's line, so a wide value never crowds it.
+        (t.sub && t.pct === undefined ? text(x + 12, y + th - 8, fitText(t.sub, 10.5, tw - 24), { size: 10.5, cls: 'su' }) : '') +
+        (t.sub && t.pct !== undefined ? text(x + tw - 12, y + 42, fitText(t.sub, 10.5, tw - 36 - textWidth(t.value, 19, false, true)), { size: 10.5, cls: 'su', anchor: 'end' }) : '') +
         (t.pct !== undefined ? meter(x + 12, y + th - 14, tw - 24, 4, t.pct / 100, pctColor(t.pct)) : '')
       )
     })
     .join('')
   const height = rows * th + (rows - 1) * gap
-  return { source: svg(W, height, body), height, alt: tiles.map(t => `${t.label} ${t.value}`).join(', ') }
+  return { source: svg(W, height, body), height, alt: tiles.map(t => `${t.label} ${t.value}${t.sub ? ` (${t.sub})` : ''}`).join(', ') }
 }
 
 // ---- pane: the current prompt -----------------------------------------------------
@@ -255,33 +307,10 @@ export function promptCard(
   out.push(spans(pad, y, [{ s: big, size: 26, weight: 700 }, { s: 'tokens', size: 12, cls: 'mu', gap: 7 }]))
   out.push(text(W - pad, y, `${extra.calls} model calls  ·  ${extra.tools} tool calls`, { size: 11, cls: 'mu', anchor: 'end' }))
 
-  // Stacked composition bar.
+  // The tokens as figures: each kind, how much of the input came from the cache, and the
+  // average a model call cost in tokens.
   y += 12
-  const barH = 10
-  out.push(`<defs><clipPath id="bar"><rect x="${pad}" y="${y}" width="${inner}" height="${barH}" rx="${barH / 2}"/></clipPath></defs>`)
-  out.push(`<rect class="track" x="${pad}" y="${y}" width="${inner}" height="${barH}" rx="${barH / 2}"/>`)
-  if (sum > 0) {
-    let x = pad
-    const segs = PARTS.map(part => {
-      const w = (t[part.key] / sum) * inner
-      const seg = w > 0 ? `<rect x="${x}" y="${y}" width="${w + 0.5}" height="${barH}" fill="${part.color}"/>` : ''
-      x += w
-      return seg
-    })
-    out.push(`<g clip-path="url(#bar)">${segs.join('')}</g>`)
-  }
-
-  // Legend.
-  y += barH + 18
-  let lx = pad
-  for (const part of PARTS) {
-    const label = `${part.label} ${fmtTokens(t[part.key])}`
-    const w = 14 + textWidth(label, 11) + 14
-    if (lx + w > W - pad + 14) break
-    out.push(`<rect x="${lx}" y="${y - 8}" width="8" height="8" rx="2" fill="${part.color}"/>`)
-    out.push(text(lx + 13, y, label, { size: 11, cls: 'mu' }))
-    lx += w
-  }
+  y = tokenFigures(out, pad, y, inner, t, extra.calls)
 
   // Models.
   y += 16
@@ -308,6 +337,36 @@ export function promptCard(
   return { source: svg(W, height, card + out.join('')), height, alt }
 }
 
+/** Of the input the model read, the share served from the cache, 0 to 100; undefined with no input. */
+export const cacheHit = (t: Tokens): number | undefined => {
+  const read = t.input + t.cacheRead + t.cacheWrite
+  return read > 0 ? (t.cacheRead / read) * 100 : undefined
+}
+
+// Small figure cells in rows, top-left at (x, y): each kind of token, the cache hit rate and
+// tokens per call. Returns the y below them.
+const tokenFigures = (out: string[], x: number, y: number, w: number, t: Tokens, calls: number): number => {
+  const hit = cacheHit(t)
+  const cells: { label: string; value: string; color: string }[] = [
+    ...PARTS.map(part => ({ label: part.label.replace(/^in$/, 'input').replace(/^out$/, 'output'), value: fmtTokens(t[part.key]), color: part.color })),
+    { label: 'cache hit', value: hit === undefined ? '—' : `${Math.round(hit)}%`, color: '#14B8A6' },
+    { label: 'per call', value: calls ? fmtTokens(total(t) / calls) : '—', color: '#888780' },
+  ]
+  const gap = 6
+  const cols = w >= 540 ? 6 : w >= 270 ? 3 : 2
+  const cw = (w - gap * (cols - 1)) / cols
+  const ch = 40
+  cells.forEach((c, i) => {
+    const cx = x + (i % cols) * (cw + gap)
+    const cy = y + Math.floor(i / cols) * (ch + gap)
+    out.push(`<rect class="track" x="${cx}" y="${cy}" width="${cw}" height="${ch}" rx="7" opacity="0.55"/>`)
+    out.push(`<rect x="${cx + 9}" y="${cy + 9}" width="7" height="7" rx="2" fill="${c.color}"/>`)
+    out.push(text(cx + 21, cy + 16, fitText(c.label, 10.5, cw - 28), { size: 10.5, cls: 'mu' }))
+    out.push(text(cx + 9, cy + 33, c.value, { size: 14, weight: 700 }))
+  })
+  return y + Math.ceil(cells.length / cols) * (ch + gap) + 6
+}
+
 export const whereOf = (m: ModelUse): string => {
   const n = m.agentIds.length
   return [m.mainCalls ? 'main' : '', n ? `${n} subagent${n === 1 ? '' : 's'}` : ''].filter(Boolean).join(' + ')
@@ -328,8 +387,12 @@ const modelRow = (x: number, y: number, w: number, m: ModelUse, promptTotal: num
       { s: fitText(m.model, 10.5, w - 16 - nameW - rightW, true), size: 10.5, cls: 'su', isMono: true, gap: 8 },
     ]) +
     text(x + w, y + 10.5, right, { size: 11, cls: 'mu', anchor: 'end' }) +
-    meter(x + 16, y + 17, w - 16 - 120, 4, promptTotal ? tokens / promptTotal : 0, color) +
-    text(x + w, y + 22, whereOf(m), { size: 10.5, cls: 'su', anchor: 'end' })
+    text(
+      x + 16,
+      y + 25,
+      fitText(`${promptTotal ? Math.round((tokens / promptTotal) * 100) : 0}% of the prompt's tokens  ·  ${whereOf(m)}`, 10.5, w - 16),
+      { size: 10.5, cls: 'su' },
+    )
   )
 }
 
@@ -460,77 +523,4 @@ export function recordMeta(W: number, p: PromptRun | undefined, t: Tokens | unde
 
   const alt = `${done} · ${p.models.map(m => modelName(m.model)).join(', ') || 'no model yet'} · ${count} tokens`
   return { source: svg(W, H, parts.join('')), height: H, alt }
-}
-
-// ---- pane: the whole conversation -------------------------------------------------------
-
-/**
- * The conversation so far, in the token counter's style: tiles for prompts sent, model calls,
- * tool calls and tokens, then the tokens split by kind in one bar with its legend.
- */
-export function conversationCard(W: number, prompts: number, c: ConversationTotals): { source: string; height: number; alt: string } {
-  const pad = 14
-  const inner = W - pad * 2
-  const sum = total(c.tokens)
-  const out: string[] = []
-  let y = 22
-  out.push(text(pad, y, 'This conversation', { size: 11, cls: 'mu', weight: 500 }))
-
-  const tiles = [
-    { label: 'Prompts sent', value: String(prompts) },
-    { label: 'Model calls', value: String(c.modelCalls) },
-    { label: 'Tool calls', value: String(c.toolCalls) },
-    { label: 'Tokens', value: fmtTokens(sum) },
-  ]
-  const gap = 8
-  const cols = W >= 480 ? 4 : 2
-  const tw = (inner - gap * (cols - 1)) / cols
-  const th = 50
-  y += 10
-  tiles.forEach((t, i) => {
-    const x = pad + (i % cols) * (tw + gap)
-    const ty = y + Math.floor(i / cols) * (th + gap)
-    out.push(`<rect class="track" x="${x}" y="${ty}" width="${tw}" height="${th}" rx="8" opacity="0.55"/>`)
-    out.push(text(x + 10, ty + 18, t.label, { size: 10.5, cls: 'mu' }))
-    out.push(text(x + 10, ty + 40, t.value, { size: 18, weight: 700 }))
-  })
-  y += Math.ceil(tiles.length / cols) * (th + gap) + 4
-
-  // Tokens by kind.
-  const barH = 8
-  out.push(`<defs><clipPath id="conv"><rect x="${pad}" y="${y}" width="${inner}" height="${barH}" rx="${barH / 2}"/></clipPath></defs>`)
-  out.push(`<rect class="track" x="${pad}" y="${y}" width="${inner}" height="${barH}" rx="${barH / 2}"/>`)
-  if (sum > 0) {
-    let x = pad
-    const segs = PARTS.map(part => {
-      const w = (c.tokens[part.key] / sum) * inner
-      const seg = w > 0 ? `<rect x="${x}" y="${y}" width="${w + 0.5}" height="${barH}" fill="${part.color}"/>` : ''
-      x += w
-      return seg
-    })
-    out.push(`<g clip-path="url(#conv)">${segs.join('')}</g>`)
-  }
-  y += barH + 18
-  let lx = pad
-  for (const part of PARTS) {
-    const label = `${part.label} ${fmtTokens(c.tokens[part.key])}`
-    const w = 14 + textWidth(label, 11) + 16
-    // Out of room: the legend goes on to a second line.
-    if (lx > pad && lx + w > W - pad + 16) {
-      lx = pad
-      y += 18
-    }
-    out.push(`<rect x="${lx}" y="${y - 8}" width="8" height="8" rx="2" fill="${part.color}"/>`)
-    out.push(text(lx + 13, y, label, { size: 11, cls: 'mu' }))
-    lx += w
-  }
-  y += 16
-
-  const height = y
-  const card = `<rect class="card" x="0.5" y="0.5" width="${W - 1}" height="${height - 1}" rx="12"/>`
-  const alt =
-    `This conversation: ${prompts} prompt${prompts === 1 ? '' : 's'} sent, ${c.modelCalls} model call${c.modelCalls === 1 ? '' : 's'}, ` +
-    `${c.toolCalls} tool call${c.toolCalls === 1 ? '' : 's'}, ${fmtTokens(sum)} tokens ` +
-    `(${PARTS.map(part => `${part.label} ${fmtTokens(c.tokens[part.key])}`).join(', ')})`
-  return { source: svg(W, height, card + out.join('')), height, alt }
 }
