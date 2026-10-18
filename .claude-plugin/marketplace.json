@@ -6,8 +6,8 @@
     {
       "name": "usage-panel",
       "source": "./",
-      "description": "Live Usage pane and a band above the prompt: tokens, models, subagents, cost and every prompt of the session.",
-      "version": "0.7.0",
+      "description": "Live Usage pane and a band above the prompt: tokens, models, subagents, cost, and each rate limit's burn rate and forecast.",
+      "version": "0.8.0",
       "category": "mod"
     }
   ]

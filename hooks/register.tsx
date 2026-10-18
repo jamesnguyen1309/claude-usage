@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { ElementConstructor, EngineInterface, Register, SessionUsage, SvgProps, TurnUsage } from 'claude-code'
+import type { EngineInterface, Register, SessionUsage, TurnUsage } from 'claude-code'
 
-import type { AgentRun, ConversationTotals, ModelUse, PromptRow, PromptRun, RunStatus, SessionFigures, Tokens } from '../types'
+import { addSamples, burnOf } from './burn'
+import type { AgentRun, BurnSample, ConversationTotals, ModelUse, PromptRow, PromptRun, RunStatus, SessionFigures, Tokens } from '../types'
 import {
   agentRow,
   bandRow,
+  burnCard,
   cacheHit,
-  crabDoneIcon,
-  crabIcon,
   fmtResetAt,
   fmtTime,
   fmtTokens,
@@ -19,7 +19,6 @@ import {
   PARTS,
   modelColor,
   promptCard,
-  recordMeta,
   sessionTiles,
   total,
   whereOf,
@@ -36,18 +35,12 @@ const session = atom({ plugin: 'usage-panel', key: 'session' } as const, {
   rateLimits: [],
 })
 const rows = atom({ plugin: 'usage-panel', key: 'rows' } as const, [])
-const listStart = atom({ plugin: 'usage-panel', key: 'listStart' } as const, 0)
 const totals = atom({ plugin: 'usage-panel', key: 'totals' } as const, null as ConversationTotals | null)
 
-// The prompt list is the pane's last section, a fixed window: its header, then PAGE cards of
-// CARD_ROWS rows (a border and three lines), each after a blank row. A wheel over it scrolls it.
-const PAGE = 4
-const CARD_ROWS = 5
-const GAP_ROWS = 1
-const LIST_ROWS = 1 + PAGE * (GAP_ROWS + CARD_ROWS)
-const CRAB = crabIcon(16)
-const CRAB_DONE = crabDoneIcon(16)
-const isListOpen = atom({ plugin: 'usage-panel', key: 'isListOpen' } as const, true)
+// Rate-limit readings, in the store: the limits are the account's, so their history spans sessions.
+const SAMPLES = 'burn-samples'
+const readSamples = async ($: EngineInterface): Promise<BurnSample[]> => ((await $.store.get(SAMPLES)) as BurnSample[] | undefined) ?? []
+
 const now = atom({ plugin: 'usage-panel', key: 'now' } as const, 0)
 
 // ---- bookkeeping ------------------------------------------------------------------
@@ -136,27 +129,10 @@ const addRow = (list: PromptRow[], row: { id: string; text: string; isDrawn: boo
   return at < 0 ? [...list, drawnRow] : [...list.slice(0, at), drawnRow, ...list.slice(at)]
 }
 
-// The usage record of a prompt row: the latest run with its text.
-const runOf = (list: PromptRun[], row: PromptRow): PromptRun | undefined => list.findLast(p => norm(p.text) === row.text)
-
 const oneLine = (s: string, max: number): string => {
   const flat = norm(s)
   return flat.length > max ? flat.slice(0, Math.max(1, max - 1)) + '…' : flat
 }
-
-// 14:32:05 today; Oct 10, 14:32 on another day.
-const fmtClock = (ms: number, today: number): string => {
-  const d = new Date(ms)
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
-  return d.toDateString() === new Date(today || ms).toDateString()
-    ? time
-    : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time.slice(0, 5)}`
-}
-
-// A translucent grey: a hover tint that reads on light and dark alike (no theme key is one).
-const HOVER_BG = '#8080802a'
-
-const STATUS_TEXT: Record<RunStatus, string> = { running: 'suggestion', done: 'success', aborted: 'warning', failed: 'error' }
 
 const GLYPH: Record<RunStatus, string> = { running: '●', done: '✓', aborted: '◼', failed: '✗' }
 const COLOR: Record<RunStatus, string> = { running: 'cyan', done: 'green', aborted: 'yellow', failed: 'red' }
@@ -202,6 +178,7 @@ export const register: Register = on => {
       await update($, session, () => figures(usage))
       const at = await $.clock.now()
       await update($, now, () => at)
+      if (usage.rateLimits.length) await $.store.set(SAMPLES, addSamples(await readSamples($), figures(usage).rateLimits, at))
     } catch {
       // No figures yet: the first session.measure fills them.
     }
@@ -239,6 +216,12 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     const result = await next(e)
     await update($, session, () => figures(e))
+    if (e.rateLimits.length) {
+      const at = await $.clock.now()
+      const kept = await readSamples($)
+      const moved = addSamples(kept, figures(e).rateLimits, at)
+      if (JSON.stringify(moved) !== JSON.stringify(kept)) await $.store.set(SAMPLES, moved)
+    }
     return result
   })
 
@@ -265,17 +248,6 @@ export const register: Register = on => {
       }
     }
     return next(e)
-  })
-
-  // The wheel over the prompt list scrolls the list, a card a tick; the pane stays put. The
-  // list is the pane's last LIST_ROWS rows, so the pointer's row in the tree says which.
-  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
-    if (e.origin.kind !== 'person' || !e.pointer || !(await read($, isListOpen))) return next(e)
-    const count = (await read($, rows)).length
-    const treeRow = e.offset - e.by + e.pointer.row
-    if (count <= PAGE || treeRow < e.contentRows - LIST_ROWS || treeRow >= e.contentRows) return next(e)
-    await update($, listStart, v => Math.max(0, Math.min(count - PAGE, Math.min(v, count - PAGE) + Math.sign(e.by))))
-    return {}
   })
 
   // A main-loop turn: one per prompt (a subagent's run raises none).
@@ -394,9 +366,10 @@ export const register: Register = on => {
     const list = (await read($, prompts)).map(normalize)
     const s = await read($, session)
     const promptRows = await read($, rows)
-    const isOpen = await read($, isListOpen)
+    const samples = await readSamples($)
     const convo = (await read($, totals)) ?? seedTotals(list)
-    const at = Math.max(await read($, now), ...list.map(p => p.startedAt), 0)
+    // `now` subscribes the pane to the ticker; the clock itself is what the burn rate reads against.
+    const at = Math.max(await read($, now), await $.clock.now(), ...list.map(p => p.startedAt), 0)
 
     const costOf = (p: PromptRun): number =>
       Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
@@ -425,132 +398,6 @@ export const register: Register = on => {
     // The prompt card and subagents show the latest prompt.
     const focus = latest
     const agents = focus ? ordered(focus.agents) : []
-
-    // Every prompt of the session, newest first, in a fixed window of PAGE cards that the wheel
-    // (or ▲ ▼) moves through. A card: a status dot, then its number and when it was sent; the
-    // prompt; when it finished, its models and tokens (drawn like the token counter on the
-    // desktop). Cards only show: a mod can't scroll the desktop app's conversation to a prompt.
-    const firstShown = await read($, listStart)
-    const promptList = (desk?: { W: number; Svg: ElementConstructor<SvgProps> }) => {
-      const cols = Math.max(24, (e.props.bodyColumns || 60) - 8)
-      const items = promptRows.map((row, i) => ({ row, run: runOf(list, row), n: i + 1 })).reverse()
-      const start = Math.max(0, Math.min(firstShown, items.length - PAGE))
-      const page = items.slice(start, start + PAGE)
-      const canScroll = items.length > PAGE
-      const move = (by: number) => update($, listStart, v => Math.max(0, Math.min(items.length - PAGE, Math.min(v, items.length - PAGE) + by)))
-
-      const card = ({ row, run, n }: (typeof items)[number]) => {
-        const isLatest = n === items.length
-        const t = run ? promptTokens(run) : undefined
-        const sent = run?.startedAt ?? row.sentAt
-        const status = run?.status
-        const done = run && status
-          ? status === 'running'
-            ? `Running ${fmtTime(at - run.startedAt)}`
-            : `${status === 'done' ? 'Done' : status === 'aborted' ? 'Stopped' : 'Failed'} ${fmtClock(run.endedAt ?? at, at)} · ${fmtTime((run.endedAt ?? at) - run.startedAt)}`
-          : ''
-        const line = (suffix: string, ...children: (string | ReturnType<typeof h>)[]) => (
-          <Box key={`line:${row.id}${suffix}`}>{h(Text, { wrap: 'truncate-end' }, ...children)}</Box>
-        )
-        const head = line(
-          '',
-          <Text key="index" color={isLatest ? 'claude' : 'subtle'} bold>
-            {`#${n}`}
-          </Text>,
-          <Text key="sent" dimColor>
-            {sent !== undefined ? `  ·  Sent ${fmtClock(sent, at)}` : '  ·  Sent before the panel was watching'}
-          </Text>,
-        )
-        const text = line(
-          ':prompt',
-          <Text key="text" bold>
-            {oneLine(row.text, cols)}
-          </Text>,
-        )
-        let meta
-        if (desk) {
-          const m = recordMeta(desk.W - 52, run, t, done)
-          meta = <desk.Svg key={`meta:${row.id}`} source={m.source} alt={m.alt} width={desk.W - 52} height={m.height} />
-        } else {
-          meta = line(
-            ':done',
-            ...(run && status
-              ? [
-                  <Text key="done" color={STATUS_TEXT[status]}>
-                    {done}
-                  </Text>,
-                  <Text key="models" dimColor>
-                    {`  ·  ${run.models.map(m => modelName(m.model)).join(', ') || 'no model yet'}`}
-                  </Text>,
-                  <Text key="tokens" bold>
-                    {`  ·  ${t && total(t) > 0 ? fmtTokens(total(t)) : 0} tokens`}
-                  </Text>,
-                ]
-              : [
-                  <Text key="none" dimColor>
-                    No figures: sent before the panel was watching
-                  </Text>,
-                ]),
-          )
-        }
-        return (
-          <Box
-            key={`card:${row.id}`}
-            flexDirection="row"
-            alignItems="flex-start"
-            gap={1}
-            height={CARD_ROWS}
-            borderStyle="round"
-            borderColor={isLatest ? 'claude' : 'subtle'}
-            hover={{ borderColor: 'claude', backgroundColor: HOVER_BG }}
-            paddingX={1}
-            marginTop={GAP_ROWS}
-          >
-            {/* The mark sits at the card's top left, beside its first line. On the desktop, Claude
-                marks a running prompt (walking) and a finished one (cheering). */}
-            <Box key={`mark:${row.id}`} alignSelf="flex-start" flexShrink={0}>
-              {desk && status === 'running' ? (
-                <desk.Svg key={`crab:${row.id}`} source={CRAB.source} alt="Claude at work" width={CRAB.width} height={CRAB.height} />
-              ) : desk && status === 'done' ? (
-                <desk.Svg key={`crab:${row.id}`} source={CRAB_DONE.source} alt="Completed" width={CRAB_DONE.width} height={CRAB_DONE.height} />
-              ) : (
-                <Text key={`dot:${row.id}`} color={status ? STATUS_TEXT[status] : 'inactive'}>
-                  ●
-                </Text>
-              )}
-            </Box>
-            <Box key={`lines:${row.id}`} flexDirection="column" flexGrow={1}>
-              {head}
-              {text}
-              {meta}
-            </Box>
-          </Box>
-        )
-      }
-
-      return (
-        <Box key="prompt-list" flexDirection="column" height={isOpen ? LIST_ROWS : 1} overflow="hidden" marginTop={1}>
-          <Box key="list-head" flexDirection="row" justifyContent="space-between">
-            <Button key="list-toggle" plain onPress={() => update($, isListOpen, v => !v)}>
-              <Text bold>{isOpen ? '▾' : '▸'} Prompts in this session</Text>
-              <Text dimColor> · {items.length}</Text>
-            </Button>
-            {isOpen && canScroll && (
-              <Box key="list-nav" flexDirection="row" gap={1}>
-                <Button key="list-newer" plain onPress={() => move(-PAGE)}>
-                  <Text color={start > 0 ? 'claude' : 'inactive'}>▲</Text>
-                </Button>
-                <Text dimColor>{`${start + 1}–${start + page.length} of ${items.length}`}</Text>
-                <Button key="list-older" plain onPress={() => move(PAGE)}>
-                  <Text color={start + PAGE < items.length ? 'claude' : 'inactive'}>▼</Text>
-                </Button>
-              </Box>
-            )}
-          </Box>
-          {isOpen && page.map(card)}
-        </Box>
-      )
-    }
 
     if (e.surface !== 'terminal' && 'Svg' in ui) {
       const { Svg } = ui
@@ -592,7 +439,15 @@ export const register: Register = on => {
               })}
             </Box>
           )}
-          {promptList({ W, Svg })}
+          {s.rateLimits.length > 0 && (
+            <Box flexDirection="column" gap={1}>
+              <Text bold>Burn rate</Text>
+              {s.rateLimits.map(r => {
+                const c = burnCard(W, burnOf(r, samples, at), at)
+                return <Svg key={`burn:${r.kind}`} source={c.source} alt={c.alt} width={W} height={c.height} />
+              })}
+            </Box>
+          )}
         </Box>
       )
     }
@@ -696,7 +551,31 @@ export const register: Register = on => {
             <Text dimColor>{'  '}Send a prompt to see its tokens, models and subagents.</Text>
           )}
         </Box>
-        {promptList()}
+        {s.rateLimits.length > 0 && (
+          <Box marginTop={1} flexDirection="column">
+            <Text bold>Burn rate</Text>
+            {s.rateLimits.map(r => {
+              const b = burnOf(r, samples, at)
+              const f = b.forecast
+              const pace = b.rate === undefined ? 'measuring…' : `${b.rate >= 10 ? Math.round(b.rate) : b.rate.toFixed(1)}%/${b.perLabel}`
+              const reset = b.resetAt !== undefined ? fmtResetAt(b.resetAt, at) : ''
+              const [line, color] =
+                f.kind === 'measuring'
+                  ? ['shows once the window has moved', undefined]
+                  : f.kind === 'idle'
+                    ? [`no use lately, stays at ${Math.round(b.pct)}%`, 'green']
+                    : f.kind === 'hits'
+                      ? [`hits 100% at ${fmtResetAt(f.at, at)}${b.resetAt !== undefined ? `, ${fmtUntil(b.resetAt - f.at)} before reload` : ''}`, 'red']
+                      : [`on pace for ${Math.round(f.atReset)}% at reload ${reset}`.trim(), pctColor(f.atReset)]
+              return (
+                <Text key={`burn:${r.kind}`} wrap="truncate-end">
+                  {'  '}
+                  {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text bold>{pace}</Text> · <Text color={color}>{line}</Text>
+                </Text>
+              )
+            })}
+          </Box>
+        )}
       </Box>
     )
   })

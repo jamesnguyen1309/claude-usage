@@ -6,7 +6,7 @@
 
 `usage-panel` is a Claude Code mod: a live **Usage** pane beside the conversation and a one-line band above the prompt input.
 
-![version](https://img.shields.io/badge/version-0.7.0-7F77DD) ![Claude Code](https://img.shields.io/badge/Claude%20Code-mod-D97757) ![surfaces](https://img.shields.io/badge/desktop%20%2B%20terminal-supported-1D9E75) ![license](https://img.shields.io/badge/license-MIT-888780)
+![version](https://img.shields.io/badge/version-0.8.0-7F77DD) ![Claude Code](https://img.shields.io/badge/Claude%20Code-mod-D97757) ![surfaces](https://img.shields.io/badge/desktop%20%2B%20terminal-supported-1D9E75) ![license](https://img.shields.io/badge/license-MIT-888780)
 
 </div>
 
@@ -64,9 +64,9 @@ One line for the prompt in progress (or the last one):
 | **Statistics** | when your tokens next reload (a countdown to the soonest rate-limit reset, and which window it is), model calls and tool calls across the conversation (main and subagents), prompts sent, session cost, context window fill, and the 5-hour and 7-day limits with when each resets; meters turn amber at 70% and red at 90% |
 | **This prompt** | total tokens, then figures for input, output, cache reads, cache writes, the cache hit rate and tokens per call; each model that worked on it: name, id, calls, tokens, its share of the prompt's tokens, and whether it ran the main conversation or subagents |
 | **Subagents** | each subagent the prompt started, nested under the one that started it, with live status, model, time, calls, tools and tokens |
-| **Prompts in this session** | every prompt you typed, newest first, as cards with room between them, in a **fixed-height list** (4 at a time) that scrolls on its own: the mouse wheel over it, or ▲ ▼, moves through older prompts while the rest of the pane stays put. Each card: a status mark (on the desktop, Claude walking while the prompt runs and cheering, claws up, once it's done; a coloured dot otherwise), its number and when you sent it; the prompt; when it finished, the models it used and its tokens, drawn like the token counter. Hovering a card tints it. |
+| **Burn rate** | for the 5-hour and 7-day limits: how fast each is being used (% per hour, % per day), and where that pace leads: *Hits 100% at 14:52, 1h 22m before it reloads* in red, or *On pace for 71% when it reloads* otherwise. A small chart shows the window so far, solid, and the pace carried on to the reload, dashed. Readings are kept across sessions, since the limits are your account's. |
 
-While Claude works, a little animated Claude (the orange pixel crab, stepping and waving) marks what is running: the prompt card, each subagent, the band and the prompt list. The desktop app draws cards, bars and chips; a terminal gets the same figures as text. `/usage-panel` shows or hides the pane.
+While Claude works, a little animated Claude (the orange pixel crab, stepping and waving) marks what is running: the prompt card, each subagent and the band. The desktop app draws cards, bars and chips; a terminal gets the same figures as text. `/usage-panel` shows or hides the pane.
 
 ## 🔄 Update · remove
 

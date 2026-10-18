@@ -70,6 +70,9 @@ export type ConversationTotals = {
   tokens: Tokens
 }
 
+/** One reading of a rate-limit window, kept (in the store, across sessions) when it moved. */
+export type BurnSample = { at: number; kind: string; pct: number; resetsAt?: string }
+
 export type RateLimit = { kind: string; percentUsed: number; resetsAt?: string }
 
 export type SessionFigures = {
@@ -88,9 +91,6 @@ declare module 'claude-code' {
       rows: PromptRow[]
       /** Null until the first model call this mod sees: then seeded from the prompts it holds. */
       totals: ConversationTotals | null
-      /** How many records the list has scrolled past, newest first. */
-      listStart: number
-      isListOpen: boolean
       now: number
     }
   }

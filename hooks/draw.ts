@@ -1,5 +1,6 @@
 // SVG drawings for the desktop: the pane's cards and rows, and the band above the prompt.
 // Pure functions of the mod's state; each returns markup and its height in CSS pixels.
+import type { Burn } from './burn'
 import type { AgentRun, ConversationTotals, ModelUse, PromptRun, RunStatus, SessionFigures, Tokens } from '../types'
 
 // ---- shared ---------------------------------------------------------------------
@@ -146,18 +147,6 @@ export const crabDone = (cx: number, cy: number, w = 16): string => {
     px(4, 16, 2, 4) + px(8, 16, 2, 4) + px(14, 16, 2, 4) + px(18, 16, 2, 4) +
     '</g>'
   )
-}
-
-/** The done crab alone, for a row drawn with text (the prompt list's mark for a finished prompt). */
-export const crabDoneIcon = (w = 16): { source: string; width: number; height: number } => {
-  const h = Math.ceil((w * 20) / 24) + 2
-  return { source: svg(w, h, crabDone(w / 2, h / 2, w)), width: w, height: h }
-}
-
-/** The crab alone, for a row drawn with text (the prompt list's dot while a prompt runs). */
-export const crabIcon = (w = 16): { source: string; width: number; height: number } => {
-  const h = Math.ceil((w * 16) / 24) + 2
-  return { source: svg(w, h, crab(w / 2, h / 2, w)), width: w, height: h }
 }
 
 const statusMark = (x: number, y: number, status: RunStatus): string => {
@@ -471,56 +460,70 @@ export function bandRow(W: number, p: PromptRun, t: Tokens, elapsedMs: number, c
   return { source: svg(W, H, parts.join('')), height: H }
 }
 
-// ---- pane: a prompt record's last line ---------------------------------------------------
+// ---- pane: burn rate ----------------------------------------------------------------------
 
 /**
- * The third line of a prompt record, in the token counter's style: when it finished (or how
- * long it has run) at the left; a pill per model, then the count, bold, at the right. Without a
- * run: a note that it has no figures.
+ * One rate-limit window: its pace, where that pace leads before it reloads, and a small chart
+ * of the window so far (solid) and the pace carried on to the reload or to 100% (dashed).
  */
-export function recordMeta(W: number, p: PromptRun | undefined, t: Tokens | undefined, done: string): { source: string; height: number; alt: string } {
-  const H = 18
-  const mid = H / 2
-  if (!p || !t) {
-    const note = 'No figures: sent before the panel was watching'
-    return { source: svg(W, H, text(0, mid + 4, note, { size: 11, cls: 'su' })), height: H, alt: note }
-  }
-  const sum = total(t)
-  const parts: string[] = []
+export function burnCard(W: number, b: Burn, now: number): { source: string; height: number; alt: string } {
+  const pad = 14
+  const inner = W - pad * 2
+  const out: string[] = []
+  const name = limitName(b.kind)
+  const reset = b.resetAt !== undefined ? fmtResetAt(b.resetAt, now) : undefined
+  const rate = b.rate === undefined ? 'measuring…' : `${b.rate >= 10 ? Math.round(b.rate) : b.rate.toFixed(1)}% / ${b.perLabel}`
 
-  // The count at the right edge, laid out with its label by the renderer.
-  const count = sum > 0 ? fmtTokens(sum) : '0'
-  const countW = textWidth(count, 12.5, false, true) + 5 + textWidth('tokens', 10.5)
-  parts.push(spans(W, mid + 4.5, [{ s: count, size: 12.5, weight: 700 }, { s: 'tokens', size: 10.5, cls: 'mu', gap: 5 }], 'end'))
-  const right = W - countW - 8
+  let y = 22
+  out.push(spans(pad, y, [{ s: name, size: 12, weight: 600 }, { s: `${Math.round(b.pct)}% used`, size: 11, cls: 'mu', gap: 8 }]))
+  out.push(text(W - pad, y, rate, { size: 12, weight: 650, anchor: 'end' }))
 
-  // The model pills sit just left of the count: as many as fit after the finish time, first used
-  // first. Where not even the first fits, the finish time drops its duration to make room.
-  const fit = (start: number) => {
-    const out: { label: string; color: string; w: number }[] = []
-    let width = 0
-    for (const m of p.models) {
-      const label = modelName(m.model)
-      const w = Math.round(textWidth(label, 10, false, true) + 14)
-      if (start + width + w + (out.length ? 4 : 0) > right) break
-      width += w + (out.length ? 4 : 0)
-      out.push({ label, color: modelColor(m.model), w })
-    }
-    return { pills: out, width }
-  }
-  let label = done
-  let { pills, width: pillsW } = fit(textWidth(label, 11, false, true) + 10)
-  if (!pills.length && p.models.length && label.includes(' · ')) {
-    label = label.split(' · ')[0] ?? label
-    ;({ pills, width: pillsW } = fit(textWidth(label, 11, false, true) + 10))
-  }
-  parts.push(text(0, mid + 4, label, { size: 11, fill: STATUS_COLOR[p.status], weight: 500 }))
-  let px = right - pillsW
-  for (const one of pills) {
-    parts.push(pill(px, mid - 8, one.label, one.color, 10).markup)
-    px += one.w + 4
-  }
+  // The forecast, coloured by how it ends.
+  const f = b.forecast
+  const [line, color] =
+    f.kind === 'measuring'
+      ? ['Measuring the pace: it shows once the window has moved', undefined]
+      : f.kind === 'idle'
+        ? [`No use lately: stays at ${Math.round(b.pct)}%${reset ? ` until it reloads ${reset}` : ''}`, '#3B9C5F']
+        : f.kind === 'hits'
+          ? [`Hits 100% at ${fmtResetAt(f.at, now)}${b.resetAt !== undefined ? `, ${fmtUntil(b.resetAt - f.at)} before it reloads` : ''}`, '#D0453F']
+          : [`On pace for ${Math.round(f.atReset)}% when it reloads ${reset ?? ''}`.trim(), pctColor(f.atReset)]
+  y += 19
+  out.push(text(pad, y, fitText(line, 11.5, inner), { size: 11.5, weight: 500, ...(color ? { fill: color } : { cls: 'mu' }) }))
 
-  const alt = `${done} · ${p.models.map(m => modelName(m.model)).join(', ') || 'no model yet'} · ${count} tokens`
-  return { source: svg(W, H, parts.join('')), height: H, alt }
+  // The chart: the window from its start to its reload, 0 to 100%.
+  y += 12
+  const ch = 54
+  const x0 = b.start
+  const x1 = b.resetAt ?? Math.max(now + 1, ...b.series.map(p => p.at))
+  const fx = (t: number) => pad + ((Math.min(x1, Math.max(x0, t)) - x0) / Math.max(1, x1 - x0)) * inner
+  const fy = (pct: number) => y + ch - (Math.min(100, Math.max(0, pct)) / 100) * ch
+  out.push(`<rect class="track" x="${pad}" y="${y}" width="${inner}" height="${ch}" rx="6" opacity="0.45"/>`)
+  out.push(`<line class="ln" x1="${pad}" y1="${fy(70)}" x2="${W - pad}" y2="${fy(70)}" stroke-dasharray="2 3"/>`)
+  // Actual: a step line, each reading held until the next.
+  const pts = b.series.filter(p => p.at >= x0)
+  const first = b.series.findLast(p => p.at < x0)
+  const steps = first ? [{ at: x0, pct: first.pct }, ...pts] : pts
+  if (steps.length) {
+    let d = `M${fx(steps[0]!.at)} ${fy(steps[0]!.pct)}`
+    for (let i = 1; i < steps.length; i++) d += `H${fx(steps[i]!.at)}V${fy(steps[i]!.pct)}`
+    out.push(`<path d="${d}" fill="none" stroke="${pctColor(b.pct)}" stroke-width="2" stroke-linejoin="round"/>`)
+  }
+  // Projected: the pace carried on.
+  if (f.kind === 'hits' || f.kind === 'makes' || f.kind === 'idle') {
+    const endAt = f.kind === 'hits' ? f.at : x1
+    const endPct = f.kind === 'hits' ? 100 : f.kind === 'makes' ? f.atReset : b.pct
+    out.push(`<path d="M${fx(now)} ${fy(b.pct)}L${fx(endAt)} ${fy(endPct)}" fill="none" stroke="${color ?? '#888780'}" stroke-width="1.6" stroke-dasharray="4 3"/>`)
+    if (f.kind === 'hits') out.push(`<circle cx="${fx(endAt)}" cy="${fy(100)}" r="3" fill="${color}"/>`)
+  }
+  out.push(`<circle cx="${fx(now)}" cy="${fy(b.pct)}" r="3.2" fill="${pctColor(b.pct)}"/>`)
+  y += ch + 15
+  out.push(text(pad, y, 'window start', { size: 10, cls: 'su' }))
+  out.push(text(fx(now), y, 'now', { size: 10, cls: 'su', anchor: fx(now) > W - pad - 40 ? 'end' : fx(now) < pad + 70 ? 'start' : 'middle' }))
+  if (reset) out.push(text(W - pad, y, `reloads ${reset}`, { size: 10, cls: 'su', anchor: 'end' }))
+  y += 12
+
+  const height = y
+  const card = `<rect class="card" x="0.5" y="0.5" width="${W - 1}" height="${height - 1}" rx="12"/>`
+  return { source: svg(W, height, card + out.join('')), height, alt: `${name}: ${Math.round(b.pct)}% used, ${rate}. ${line}` }
 }
