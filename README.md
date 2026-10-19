@@ -6,7 +6,7 @@
 
 `usage-panel` is a Claude Code mod: a live **Usage** pane beside the conversation and a one-line band above the prompt input.
 
-![version](https://img.shields.io/badge/version-0.9.0-7F77DD) ![Claude Code](https://img.shields.io/badge/Claude%20Code-mod-D97757) ![surfaces](https://img.shields.io/badge/desktop%20%2B%20terminal-supported-1D9E75) ![license](https://img.shields.io/badge/license-MIT-888780)
+![version](https://img.shields.io/badge/version-0.9.0-7F77DD) ![Claude Code](https://img.shields.io/badge/Claude%20Code-mod-D97757) ![surfaces](https://img.shields.io/badge/desktop%20%2B%20terminal-supported-1D9E75) ![license](https://img.shields.io/badge/license-MIT-888780) ![pulls](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjamesnguyen1309%2Fclaude-usage%2Fmain%2F.github%2Fbadges%2Fpulls.json) ![unique pulls in the last 14 days](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjamesnguyen1309%2Fclaude-usage%2Fmain%2F.github%2Fbadges%2Funique-pulls.json)
 
 </div>
 

@@ -1,0 +1,32 @@
+# Once a day: keeps the clone traffic GitHub would drop after 14 days, and refreshes the README's
+# pulls badges. Needs the secret TRAFFIC_TOKEN: a fine-grained token for this repository with
+# Administration read-only (the built-in GITHUB_TOKEN can't read traffic).
+name: Traffic badges
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  badges:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read traffic and write the badges
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: bash .github/scripts/traffic-badges.sh "${{ github.repository }}"
+
+      - name: Commit what changed
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898283+github-actions[bot]@users.noreply.github.com'
+          git add .github/badges
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'Badges: update pull counts'
+          git push
