@@ -356,6 +356,17 @@ const tokenFigures = (out: string[], x: number, y: number, w: number, t: Tokens,
   return y + Math.ceil(cells.length / cols) * (ch + gap) + 6
 }
 
+/**
+ * The model the prompt's main conversation ran on: the one with the most main-loop calls (the
+ * first used, on a tie). Not the last call's model: the engine makes small side calls inside a
+ * turn (on Haiku, say) that would win that. Never a subagent's model: falls back to the model
+ * the turn named, else none.
+ */
+export const mainModelOf = (p: PromptRun): string => {
+  const best = p.models.reduce<ModelUse | undefined>((top, m) => (m.mainCalls > (top?.mainCalls ?? 0) ? m : top), undefined)
+  return best?.model ?? p.model ?? ''
+}
+
 export const whereOf = (m: ModelUse): string => {
   const n = m.agentIds.length
   return [m.mainCalls ? 'main' : '', n ? `${n} subagent${n === 1 ? '' : 's'}` : ''].filter(Boolean).join(' + ')
@@ -421,7 +432,7 @@ export function bandRow(W: number, p: PromptRun, t: Tokens, elapsedMs: number, c
   const parts: string[] = [statusMark(9, mid, p.status)]
   let x = 22
 
-  const mainModel = p.model || p.models[0]?.model || ''
+  const mainModel = mainModelOf(p)
   if (mainModel) {
     const chip = pill(x, mid - 9, modelName(mainModel), modelColor(mainModel))
     parts.push(chip.markup)

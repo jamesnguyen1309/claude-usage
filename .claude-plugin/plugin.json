@@ -1,6 +1,6 @@
 {
   "name": "usage-panel",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Live Usage pane and a band above the prompt: when your tokens reload, calls, cost, context and rate limits; each prompt's tokens, models and subagents; and each limit's burn rate and forecast; and export or import the context (/usage-panel).",
   "author": { "name": "James", "url": "https://github.com/jamesnguyen1309" },
   "homepage": "https://github.com/jamesnguyen1309/claude-usage",

@@ -292,3 +292,45 @@ test('an import too big for the context window keeps its newest part', async () 
   expect(note.text).toMatch(/## Claude\n\nnewest answer/)
   expect(note.text).not.toMatch(/^## User/m)
 })
+
+test('the strip names the main conversation’s model, not a subagent’s or a side call’s', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', async () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }))
+  // Each step answers on the model it names.
+  on('turn.step', async function* (_$, e) {
+    return {
+      turnId: e.turnId,
+      index: e.index,
+      answer: '',
+      toolUses: [],
+      stopReason: 'end_turn',
+      usage: { model: e.model, input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    } as never
+  })
+  const step = async (e: object) => {
+    for await (const _ of $.turn.step({ messageCount: 1, ...e } as never)) void _
+  }
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, { key: 'beneath' }, '') as never
+  })
+  await $.turn.start({ text: 'Plan and build it', turnId: 't1' })
+  // A subagent on Haiku is the first model seen; the main loop runs on Opus; the turn ends with
+  // a small side call on Haiku in the main loop.
+  await $.agent.spawn({ tool_use_id: 'x1', prompt: 'p', description: 'Plan', subagentType: 'Plan' } as never)
+  await step({ turnId: 'r1', index: 0, model: 'claude-haiku-5-5', agentId: 'a1' })
+  await step({ turnId: 't1', index: 0, model: 'claude-opus-5-5' })
+  await step({ turnId: 't1', index: 1, model: 'claude-opus-5-5' })
+  await step({ turnId: 't1', index: 2, model: 'claude-haiku-5-5' })
+
+  const desk = await $.ui.mount({ ...BAND, surface: 'desktop', props: bandProps })
+  const band = await svgProps(desk, /claude-opus-5-5|claude-haiku-5-5/)
+  expect(band?.alt).toMatch(/^claude-opus-5-5 \+ Haiku 5\.5: /)
+  expect(band?.source).toMatch(/>Opus 5\.5</)
+  await desk.unmount()
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  expect(await term.find({ type: 'Text', text: 'Opus 5.5' })).toBeDefined()
+  await term.unmount()
+})

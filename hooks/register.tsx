@@ -15,6 +15,7 @@ import {
   fmtUntil,
   fmtUsd,
   limitName,
+  mainModelOf,
   modelName,
   nextReset,
   PARTS,
@@ -376,7 +377,7 @@ export const register: Register = on => {
             ? p
             : {
                 ...p,
-                model: model || p.model,
+                model: p.model || model,
                 calls: p.calls + 1,
                 tools: p.tools + tools,
                 tokens: usage ? add(p.tokens, usage) : p.tokens,
@@ -698,7 +699,7 @@ export const register: Register = on => {
     const t = promptTokens(p)
     const elapsedMs = (p.endedAt ?? at) - p.startedAt
     const cost = Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
-    const mainModel = p.model || p.models[0]?.model || ''
+    const mainModel = mainModelOf(p)
     const others = p.models.filter(m => m.model !== mainModel).map(m => modelName(m.model))
     const alt = `${mainModel || 'no model yet'}${others.length ? ` + ${others.join(', ')}` : ''}: ${fmtTokens(total(t))} tokens (${fmtTokens(t.output)} out), ${fmtTime(elapsedMs)}, ≈${fmtUsd(cost)}`
 
