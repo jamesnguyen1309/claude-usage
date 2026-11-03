@@ -82,9 +82,6 @@ export type ConversationTotals = {
   tokens: Tokens
 }
 
-/** A context export on disk, as the pane lists it. */
-export type ContextExport = { name: string; path: string; size: number; mtimeMs: number }
-
 /** One reading of a rate-limit window, kept (in the store, across sessions) when it moved. */
 export type BurnSample = { at: number; kind: string; pct: number; resetsAt?: string }
 
@@ -107,10 +104,6 @@ declare module 'claude-code' {
       /** Null until the first model call this mod sees: then seeded from the prompts it holds. */
       totals: ConversationTotals | null
       now: number
-      /** The newest context exports, newest first. */
-      exports: ContextExport[]
-      /** What the last export or import did, shown under the Context heading. */
-      contextNote: string
       /** Where the context compacts (or fills, with auto-compact off); null until measured. */
       compact: CompactPoint | null
       /** The cache lifetime the mod has learned, mirrored from the store for the drawings. */

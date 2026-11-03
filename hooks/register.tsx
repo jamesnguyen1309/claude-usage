@@ -3,8 +3,7 @@ import type { EngineInterface, Register, SessionUsage, TurnUsage } from 'claude-
 
 import { addSamples, burnOf } from './burn'
 import { costliest, isRewrite, lastCallOf, learnTtl, promptsUntil, rewriteUsd, warmFor } from './cache'
-import { estTokens, exportDir, exportName, formatExport, importNote } from './context'
-import type { AgentRun, BurnSample, CacheTtl, CompactPoint, ContextExport, ConversationTotals, ModelUse, PromptRow, PromptRun, RateLimit, RunStatus, SessionFigures, Tokens } from '../types'
+import type { AgentRun, BurnSample, CacheTtl, CompactPoint, ConversationTotals, ModelUse, PromptRow, PromptRun, RateLimit, RunStatus, SessionFigures, Tokens } from '../types'
 import {
   agentRow,
   bandRow,
@@ -66,8 +65,6 @@ async function warnPace($: EngineInterface, limits: RateLimit[], samples: BurnSa
 }
 
 const now = atom({ plugin: 'usage-panel', key: 'now' } as const, 0)
-const exportsList = atom({ plugin: 'usage-panel', key: 'exports' } as const, [] as ContextExport[])
-const contextNote = atom({ plugin: 'usage-panel', key: 'contextNote' } as const, '')
 const compact = atom({ plugin: 'usage-panel', key: 'compact' } as const, null as CompactPoint | null)
 const cacheTtl = atom({ plugin: 'usage-panel', key: 'cacheTtl' } as const, '5m' as CacheTtl)
 
@@ -192,71 +189,6 @@ const bar = (pct: number, width: number): string => {
 
 const LIMIT_NAME: Record<string, string> = { five_hour: '5-hour', seven_day: '7-day', spend_limit: 'spend' }
 
-// ---- context export and import ----------------------------------------------------------
-
-/** Exports listed in the pane, newest first. */
-const EXPORTS_SHOWN = 4
-/** An import takes at most this share of the free context window, leaving room to work. */
-const IMPORT_SHARE = 0.6
-
-const contextFolder = async ($: EngineInterface): Promise<string> => {
-  const root = await $.session.root()
-  const home = await $.env.get('HOME')
-  return home ? exportDir(home, root) : `${root}/.claude/context-exports`
-}
-
-async function refreshExports($: EngineInterface): Promise<void> {
-  const dir = await contextFolder($)
-  const found = (await $.fs.exists(dir)) ? await $.fs.list(dir) : []
-  const list = found
-    .filter(f => f.kind === 'file' && f.name.endsWith('.md'))
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
-    .slice(0, EXPORTS_SHOWN)
-    .map(f => ({ name: f.name, path: `${dir}/${f.name}`, size: f.size, mtimeMs: f.mtimeMs }))
-  await update($, exportsList, () => list)
-}
-
-/** Writes the conversation, as the context window holds it, to a Markdown file. */
-async function exportContext($: EngineInterface): Promise<void> {
-  try {
-    const at = await $.clock.now()
-    const messages = await $.session.messages()
-    const text = formatExport(messages, { at, project: await $.session.root(), sessionId: await $.session.id(), model: await $.session.model() })
-    const path = `${await contextFolder($)}/${exportName(at)}`
-    await $.fs.write(path, text)
-    await update($, contextNote, () => `Exported ${messages.length} messages, ≈${fmtTokens(estTokens(text))} tokens, to ${path}`)
-    await refreshExports($)
-  } catch (err) {
-    await update($, contextNote, () => `Export failed: ${err instanceof Error ? err.message : String(err)}`)
-  }
-}
-
-/** Reads an export back into the context window: a note the model reads with the next prompt. */
-async function importContext($: EngineInterface, x: ContextExport): Promise<void> {
-  try {
-    const { context } = await $.session.usage()
-    const free = Math.max(0, context.window - (context.tokens ?? 0))
-    const budget = Math.floor(free * IMPORT_SHARE)
-    if (budget < 2000) {
-      await update($, contextNote, () => 'Not enough room in the context window to import: run /compact or /clear first.')
-      return
-    }
-    const note = importNote(await $.fs.read(x.path), x.name, budget)
-    const added = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: note.text }] } })
-    await update($, contextNote, () =>
-      added.deny !== undefined
-        ? `Import refused: ${added.deny}`
-        : `Imported ${x.name}, ≈${fmtTokens(note.tokens)} tokens${note.isCut ? ' (the oldest part left out to fit)' : ''}. Claude reads it with your next prompt.`,
-    )
-  } catch (err) {
-    await update($, contextNote, () => `Import failed: ${err instanceof Error ? err.message : String(err)}`)
-  }
-}
-
-// 18 Oct, 09:41
-const fmtStamp = (ms: number): string =>
-  new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })
-
 /** Why a prompt cost more than its tokens suggest: its first call rewrote the cache. */
 const rewriteNote = (p: PromptRun, costUsd: number): string | undefined => {
   const r = p.cacheRewrite
@@ -297,7 +229,7 @@ export const register: Register = on => {
     const started = await next(e)
     await $.command.register({
       name: 'usage-panel',
-      description: 'Show or hide the live Usage pane: statistics, this prompt, burn rate, and context export and import',
+      description: 'Show or hide the live Usage pane: statistics, this prompt, costliest prompts and burn rate',
     })
     try {
       const usage = await $.session.usage()
@@ -325,7 +257,6 @@ export const register: Register = on => {
         await update($, now, () => at)
       })()
     })
-    void refreshExports($).catch(() => undefined)
     void $.ui.open({ id: PANE, title: TITLE })
     return started
   })
@@ -519,7 +450,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
-    const { Box, Text, Button } = ui
+    const { Box, Text } = ui
     const list = (await read($, prompts)).map(normalize)
     const s = await read($, session)
     const promptRows = await read($, rows)
@@ -551,42 +482,10 @@ export const register: Register = on => {
       return out
     }
 
-    const exportsShown = await read($, exportsList)
-    const ctxNote = await read($, contextNote)
     const comp = await read($, compact)
     const growth = comp && s.contextTokens !== undefined ? promptsUntil(list, s.contextTokens, comp.tokens) : undefined
     const forecast = growth && comp ? { ...growth, isAuto: comp.isAuto } : undefined
     const top = costliest(list, costOf, TOP).map(r => ({ ...r, tokens: total(promptTokens(r.p)) }))
-
-    // Context: export the conversation to a file, or read an export back in. The same on every surface.
-    const contextSection = (
-      <Box key="context" flexDirection="column" marginTop={1}>
-        <Box key="context-head" flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text bold>Context</Text>
-          <Button key="context-export" label="Export context" onPress={() => void exportContext($)} />
-        </Box>
-        {ctxNote ? (
-          <Text key="context-note" dimColor wrap="wrap">
-            {ctxNote}
-          </Text>
-        ) : null}
-        {exportsShown.length ? (
-          exportsShown.map(x => (
-            <Box key={`export:${x.name}`} flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
-              <Text wrap="truncate-end">
-                {fmtStamp(x.mtimeMs)}
-                <Text dimColor> · ≈{fmtTokens(x.size / 4)} tokens</Text>
-              </Text>
-              <Button key={`import:${x.name}`} label="Import" onPress={() => void importContext($, x)} />
-            </Box>
-          ))
-        ) : (
-          <Text key="context-none" dimColor>
-            No exports yet: export this conversation to save it whole, then import it here or in another session.
-          </Text>
-        )}
-      </Box>
-    )
 
     const latest = list.at(-1)
     // The prompt card and subagents show the latest prompt.
@@ -650,7 +549,6 @@ export const register: Register = on => {
               })}
             </Box>
           )}
-          {contextSection}
         </Box>
       )
     }
@@ -807,7 +705,6 @@ export const register: Register = on => {
             })}
           </Box>
         )}
-        {contextSection}
       </Box>
     )
   })
