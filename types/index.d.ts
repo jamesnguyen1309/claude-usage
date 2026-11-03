@@ -50,7 +50,19 @@ export type PromptRun = {
   agents: AgentRun[]
   /** Every model that worked on the prompt, first used first. */
   models: ModelUse[]
+  /** When its main conversation last called the model ($.clock.now() ms): the cache is warm from then. */
+  lastCallAt?: number
+  /** The context after its latest main-loop call: input, cache and output tokens. */
+  contextAfter?: number
+  /** Set when its first call rewrote the cache: how many tokens, and how long the conversation sat idle before it. */
+  cacheRewrite?: { tokens: number; idleMs: number; ttl: CacheTtl }
 }
+
+/** How long the prompt cache keeps the conversation after its last call. */
+export type CacheTtl = '5m' | '1h'
+
+/** Where the context window compacts, from /context's breakdown: its window less the compaction buffer. */
+export type CompactPoint = { tokens: number; isAuto: boolean }
 
 /** One of your prompts as the conversation keeps it: an entry of the prompt list. */
 export type PromptRow = {
@@ -99,6 +111,10 @@ declare module 'claude-code' {
       exports: ContextExport[]
       /** What the last export or import did, shown under the Context heading. */
       contextNote: string
+      /** Where the context compacts (or fills, with auto-compact off); null until measured. */
+      compact: CompactPoint | null
+      /** The cache lifetime the mod has learned, mirrored from the store for the drawings. */
+      cacheTtl: CacheTtl
     }
   }
 }

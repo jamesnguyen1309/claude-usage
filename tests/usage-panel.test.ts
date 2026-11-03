@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { importNote } from '../hooks/context'
@@ -235,6 +236,172 @@ test('the burn rate reads each window’s pace and forecasts where it ends', asy
   // The 7-day window has one reading: still measuring.
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
   expect((await svgProps(desk, /^7-day limit: /))?.alt).toMatch(/measuring…/)
+  await desk.unmount()
+})
+
+test('a toast warns once per window when its pace runs out before it reloads', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-18T10:00:00Z') })
+  mock.store(on)
+  on('session.measure', async () => ({ changed: [] }) as never)
+  const toasts: string[] = []
+  on('ui.toast', async (_$, e) => (toasts.push(e.text), { value: undefined }) as never)
+  const measure = (pct: number, resetsAt = '2026-10-18T13:00:00Z') =>
+    $.session.measure({
+      context: { tokens: 1000, window: 200_000, percent: 1 },
+      rateLimits: [{ kind: 'five_hour', percentUsed: pct, resetsAt }],
+      changed: ['rateLimits'],
+    } as never)
+
+  // 20% → 30% in half an hour, 2h30m from the reload: at 20% an hour it lasts, so nothing yet.
+  await measure(20)
+  await clock.advance(30 * 60_000)
+  await measure(30)
+  expect(toasts).toEqual([])
+
+  // 50% an hour in: at 30% an hour it runs out 20 minutes early.
+  await clock.advance(30 * 60_000)
+  await measure(50)
+  expect(toasts).toHaveLength(1)
+  expect(toasts[0]).toMatch(/^5-hour limit: on pace to hit 100% at \d\d:\d\d, 20m before it reloads$/)
+
+  // Still on that pace: the same window is not warned of again.
+  await clock.advance(10 * 60_000)
+  await measure(55)
+  expect(toasts).toHaveLength(1)
+
+  // The next window, burnt as fast, is warned of in its turn.
+  await clock.advance(3 * 60 * 60_000)
+  await measure(0, '2026-10-18T18:00:00Z')
+  await clock.advance(60 * 60_000)
+  await measure(40, '2026-10-18T18:00:00Z')
+  expect(toasts).toHaveLength(2)
+})
+
+// Prompts run one after another on Opus: each step answers with the usage the test names, and
+// the session's cost moves by the amount the prompt names while it runs.
+function prompts($: Parameters<TestBody>[0], on: On) {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-18T10:00:00Z') })
+  mock.store(on)
+  on('session.measure', async () => ({ changed: [] }) as never)
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', async () => ({ text: '' }))
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, { key: 'beneath' }, '') as never
+  })
+  let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: { model: 'claude-opus-5-5', ...usage } } as never
+  })
+  let cost = 0
+  const measure = (contextTokens: number) =>
+    $.session.measure({ context: { tokens: contextTokens, window: 200_000, percent: (contextTokens / 2000) | 0 }, rateLimits: [], cost: { usd: cost }, changed: ['cost'] } as never)
+  let n = 0
+  const run = async (text: string, o: { read: number; write: number; output?: number; usd: number }) => {
+    const turnId = `t${++n}`
+    usage = { input_tokens: 50, output_tokens: o.output ?? 500, cache_read_input_tokens: o.read, cache_creation_input_tokens: o.write }
+    await $.turn.start({ text, turnId })
+    for await (const _ of $.turn.step({ turnId, index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+    cost += o.usd
+    await measure(50 + o.read + o.write + (o.output ?? 500))
+    await $.turn.complete({ turnId, reason: 'answer', isAborted: false, answer: '' } as never)
+  }
+  return { clock, run, measure }
+}
+
+const bandText = async (ui: { findAll: (q: object) => Promise<Found[]> }) =>
+  (await ui.findAll({ type: 'Text' })).map(x => x.text ?? '').join(' ')
+
+test('the band counts down the cache, and a prompt that rewrote it says what that cost', async ($, on) => {
+  const { clock, run } = prompts($, on)
+  await run('Read the codebase', { read: 0, write: 20_000, usd: 0.2 })
+
+  // Done: the cache holds the conversation for 5 minutes from the last call.
+  await clock.advance(2 * 60_000)
+  let term = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  expect(await term.find({ type: 'Text', text: 'cache warm 3m 00s' })).toBeDefined()
+  await term.unmount()
+  const desk = await $.ui.mount({ ...BAND, surface: 'desktop', props: bandProps })
+  expect((await svgProps(desk, /claude-opus-5-5/))?.alt).toMatch(/, cache warm 3m 00s$/)
+  await desk.unmount()
+
+  // Past 5 minutes: cold.
+  await clock.advance(4 * 60_000)
+  term = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  expect(await term.find({ type: 'Text', text: 'cache cold' })).toBeDefined()
+  await term.unmount()
+
+  // The next prompt, 6 minutes on, wrote the whole conversation again.
+  await run('Now fix the bug', { read: 0, write: 180_000, usd: 0.5 })
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal', props: paneProps })
+  const note = (await pane.find({ type: 'Text', text: /^ {2}Cache rewritten/ }))?.text
+  // 180k written at 1.25 against 50 in + 2,500 for 500 out: nearly all of the $0.50.
+  expect(note).toMatch(/^ {2}Cache rewritten after 6m 00s idle \(the cache lasts 5m\): 180k tokens, ≈\$0\.494 of this prompt$/)
+  await pane.unmount()
+  const card = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
+  expect((await svgProps(card, /^Last prompt: Now fix the bug/))?.alt).toMatch(/Cache rewritten after 6m 00s idle/)
+  await card.unmount()
+})
+
+test('a cache read after more than 5 idle minutes teaches it the cache lasts an hour', async ($, on) => {
+  const { clock, run } = prompts($, on)
+  await run('First', { read: 0, write: 20_000, usd: 0.2 })
+  await clock.advance(10 * 60_000)
+  await run('Second', { read: 20_000, write: 300, usd: 0.05 })
+  // No rewrite, and 10 minutes on the cache is still warm, for 50 more.
+  await clock.advance(10 * 60_000)
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  expect(await bandText(term)).toMatch(/cache warm 50m 00s/)
+  await term.unmount()
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal', props: paneProps })
+  expect(await pane.find({ type: 'Text', text: /Cache rewritten/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('the statistics forecast how many prompts until auto-compact', async ($, on) => {
+  const { run } = prompts($, on)
+  // A 200k window less a 33k compaction buffer: it compacts at 167k.
+  on('session.usage', async () =>
+    ({ value: {
+      startedAt: 0,
+      context: {
+        tokens: 0,
+        window: 200_000,
+        breakdown: {
+          categories: [{ name: 'Autocompact buffer', tokens: 33_000, color: 'inactive', isDeferred: false, kind: 'buffer' }],
+          totalTokens: 0,
+          maxTokens: 200_000,
+          rawMaxTokens: 200_000,
+        },
+      },
+      rateLimits: [],
+    } }) as never,
+  )
+  // 40k, then 60k, then 80k: 20k a prompt; from 80.55k, 87k to go is 5 more prompts.
+  for (const read of [40_000, 60_000, 80_000]) await run('Grow', { read, write: 0, usd: 0.01 })
+
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal', props: paneProps })
+  expect(await term.find({ type: 'Text', text: /^ {2}~5 prompts until auto-compact · \+20k per prompt$/ })).toBeDefined()
+  await term.unmount()
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
+  expect((await svgProps(desk, /Model calls/))?.alt).toMatch(/Auto-compact in ~5 prompts \(\+20k per prompt\)/)
+  await desk.unmount()
+})
+
+test('the costliest prompts are listed, costliest first', async ($, on) => {
+  const { run } = prompts($, on)
+  await run('Cheap question', { read: 1000, write: 0, usd: 0.02 })
+  await run('Refactor the whole app', { read: 1000, write: 0, usd: 1.4 })
+  await run('Write the tests', { read: 1000, write: 0, usd: 0.35 })
+
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal', props: paneProps })
+  const lines = (await term.findAll({ type: 'Text', text: /^ {2}\d\. / })).map(x => x.text)
+  expect(lines[0]).toMatch(/^ {2}1\. {2}\$1\.40 “Refactor the whole app”/)
+  expect(lines[1]).toMatch(/^ {2}2\. \$0\.350 “Write the tests”/)
+  expect(lines[2]).toMatch(/^ {2}3\. \$0\.020 “Cheap question”/)
+  await term.unmount()
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: paneProps })
+  expect((await svgProps(desk, /^Costliest prompts: /))?.alt).toMatch(/^Costliest prompts: 1\. Refactor the whole app \$1\.40, .*; 2\. Write the tests \$0\.350, .*; 3\. Cheap question \$0\.020/)
   await desk.unmount()
 })
 

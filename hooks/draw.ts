@@ -207,7 +207,7 @@ export const limitName = (kind: string): string => LIMIT_NAME[kind] ?? kind
 export function sessionTiles(
   W: number,
   s: SessionFigures,
-  o: { now: number; prompts: number; calls: ConversationTotals },
+  o: { now: number; prompts: number; calls: ConversationTotals; compact?: { prompts: number; perPrompt: number; isAuto: boolean } },
 ): { source: string; height: number; alt: string } {
   type Tile = { label: string; value: string; sub?: string; pct?: number; accent?: string }
   const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
@@ -233,6 +233,14 @@ export function sessionTiles(
       value: `${Math.round(ctxPct)}%`,
       sub: s.contextTokens !== undefined ? `${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextWindow)}` : undefined,
       pct: ctxPct,
+    })
+  }
+  if (o.compact) {
+    tiles.push({
+      label: o.compact.isAuto ? 'Auto-compact in' : 'Context full in',
+      value: `~${o.compact.prompts} prompt${o.compact.prompts === 1 ? '' : 's'}`,
+      sub: `+${fmtTokens(o.compact.perPrompt)} per prompt`,
+      accent: o.compact.prompts <= 2 ? '#C9A227' : undefined,
     })
   }
   for (const r of s.rateLimits) {
@@ -271,7 +279,7 @@ export function promptCard(
   W: number,
   p: PromptRun,
   t: Tokens,
-  extra: { costUsd: number; elapsedMs: number; calls: number; tools: number; title?: string },
+  extra: { costUsd: number; elapsedMs: number; calls: number; tools: number; title?: string; note?: string },
 ): { source: string; height: number; alt: string } {
   const pad = 14
   const inner = W - pad * 2
@@ -301,6 +309,13 @@ export function promptCard(
   y += 12
   y = tokenFigures(out, pad, y, inner, t, extra.calls)
 
+  // A cache rewrite, in amber: why this prompt cost more than its tokens suggest.
+  if (extra.note) {
+    y += 8
+    out.push(text(pad, y, fitText(extra.note, 11, inner), { size: 11, weight: 500, fill: '#C9A227' }))
+    y += 4
+  }
+
   // Models.
   y += 16
   out.push(`<line class="ln" x1="${pad}" y1="${y}" x2="${W - pad}" y2="${y}"/>`)
@@ -322,7 +337,8 @@ export function promptCard(
   const alt =
     `${extra.title ?? (p.status === 'running' ? 'Working on' : 'Last prompt')}: ${p.text}. ${fmtTokens(sum)} tokens ` +
     `(${PARTS.map(part => `${part.label} ${fmtTokens(t[part.key])}`).join(', ')}). ` +
-    `Models: ${p.models.map(m => `${modelName(m.model)} (${m.model}) ${whereOf(m)} ${fmtTokens(total(m.tokens))}`).join('; ') || 'none yet'}.`
+    `Models: ${p.models.map(m => `${modelName(m.model)} (${m.model}) ${whereOf(m)} ${fmtTokens(total(m.tokens))}`).join('; ') || 'none yet'}.` +
+    (extra.note ? ` ${extra.note}.` : '')
   return { source: svg(W, height, card + out.join('')), height, alt }
 }
 
@@ -420,13 +436,50 @@ export function agentRow(W: number, a: AgentRun, depth: number, elapsedMs: numbe
   return { source: svg(W, H, body), height: H }
 }
 
+// ---- pane: costliest prompts ---------------------------------------------------------
+
+/** The prompts that cost the most: each one's text, cost, tokens, time and when it was sent. */
+export function topCard(
+  W: number,
+  top: { p: PromptRun; usd: number; tokens: number }[],
+  now: number,
+): { source: string; height: number; alt: string } {
+  const pad = 14
+  const rowH = 40
+  const max = top[0]?.usd ?? 0
+  const out: string[] = []
+  top.forEach(({ p, usd, tokens }, i) => {
+    const y = 10 + i * rowH
+    const cost = fmtUsd(usd)
+    const costW = textWidth(cost, 13, false, true) + 12
+    const sent = fmtResetAt(p.startedAt, now)
+    out.push(text(pad, y + 16, `${i + 1}`, { size: 12, cls: 'su', weight: 600 }))
+    out.push(text(pad + 18, y + 16, fitText(`“${p.text || '(no text)'}”`, 12.5, W - pad * 2 - 18 - costW), { size: 12.5, weight: 500 }))
+    out.push(text(W - pad, y + 16, cost, { size: 13, weight: 700, anchor: 'end' }))
+    out.push(text(pad + 18, y + 31, fitText(`${fmtTokens(tokens)} tokens  ·  ${fmtTime((p.endedAt ?? p.startedAt) - p.startedAt)}  ·  sent ${sent}`, 10.5, W - pad * 2 - 18 - 64), { size: 10.5, cls: 'su' }))
+    out.push(meter(W - pad - 56, y + 26, 56, 4, max ? usd / max : 0, CLAY))
+    if (i < top.length - 1) out.push(`<line class="ln" x1="${pad + 18}" y1="${y + rowH - 0.5}" x2="${W - pad}" y2="${y + rowH - 0.5}"/>`)
+  })
+  const height = 10 + top.length * rowH + 4
+  const card = `<rect class="card" x="0.5" y="0.5" width="${W - 1}" height="${height - 1}" rx="12"/>`
+  const alt = `Costliest prompts: ${top.map(({ p, usd, tokens }, i) => `${i + 1}. ${p.text} ${fmtUsd(usd)}, ${fmtTokens(tokens)} tokens`).join('; ')}`
+  return { source: svg(W, height, card + out.join('')), height, alt }
+}
+
 // ---- band above the prompt ------------------------------------------------------------
 
 /**
  * One line: status, the main model's id (and other models as chips), the prompt's tokens
  * with output beside them, elapsed time and cost; trimmed from the right as space runs out.
  */
-export function bandRow(W: number, p: PromptRun, t: Tokens, elapsedMs: number, costUsd: number): { source: string; height: number } {
+export function bandRow(
+  W: number,
+  p: PromptRun,
+  t: Tokens,
+  elapsedMs: number,
+  costUsd: number,
+  cache?: { label: string; isWarm: boolean },
+): { source: string; height: number } {
   const H = 24
   const mid = H / 2
   const parts: string[] = [statusMark(9, mid, p.status)]
@@ -455,6 +508,15 @@ export function bandRow(W: number, p: PromptRun, t: Tokens, elapsedMs: number, c
     if (x + rightW + w + 24 > W) break
     right.push({ s: extra, size: 11, cls: 'su', gap: 10 })
     rightW += w
+  }
+  // The cache's countdown, teal while warm: the next prompt reads it for a tenth of the price.
+  if (cache) {
+    const seg = `·  ${cache.label}`
+    const w = 10 + textWidth(seg, 11)
+    if (x + rightW + w + 24 <= W) {
+      right.push({ s: seg, size: 11, gap: 10, ...(cache.isWarm ? { fill: '#14B8A6' } : { cls: 'su' }) })
+      rightW += w
+    }
   }
 
   // Subagents' models, as small chips, while there is room before the right side.

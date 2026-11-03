@@ -2,8 +2,9 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionUsage, TurnUsage } from 'claude-code'
 
 import { addSamples, burnOf } from './burn'
+import { costliest, isRewrite, lastCallOf, learnTtl, promptsUntil, rewriteUsd, warmFor } from './cache'
 import { estTokens, exportDir, exportName, formatExport, importNote } from './context'
-import type { AgentRun, BurnSample, ContextExport, ConversationTotals, ModelUse, PromptRow, PromptRun, RunStatus, SessionFigures, Tokens } from '../types'
+import type { AgentRun, BurnSample, CacheTtl, CompactPoint, ContextExport, ConversationTotals, ModelUse, PromptRow, PromptRun, RateLimit, RunStatus, SessionFigures, Tokens } from '../types'
 import {
   agentRow,
   bandRow,
@@ -22,6 +23,7 @@ import {
   modelColor,
   promptCard,
   sessionTiles,
+  topCard,
   total,
   whereOf,
 } from './draw'
@@ -43,9 +45,49 @@ const totals = atom({ plugin: 'usage-panel', key: 'totals' } as const, null as C
 const SAMPLES = 'burn-samples'
 const readSamples = async ($: EngineInterface): Promise<BurnSample[]> => ((await $.store.get(SAMPLES)) as BurnSample[] | undefined) ?? []
 
+// The windows already warned of running out early, by kind and reset time: in the store too, so
+// one window is warned of once, whichever session sees it first.
+const WARNED = 'pace-warned'
+
+/** Toasts once per window when its pace would use it up before it reloads. */
+async function warnPace($: EngineInterface, limits: RateLimit[], samples: BurnSample[], at: number) {
+  const warned = ((await $.store.get(WARNED)) as string[] | undefined) ?? []
+  const fresh: string[] = []
+  for (const r of limits) {
+    const b = burnOf(r, samples, at)
+    if (b.forecast.kind !== 'hits' || b.resetAt === undefined) continue
+    const id = `${r.kind}@${r.resetsAt}`
+    if (warned.includes(id)) continue
+    fresh.push(id)
+    $.ui.toast(`${limitName(r.kind)}: on pace to hit 100% at ${fmtResetAt(b.forecast.at, at)}, ${fmtUntil(b.resetAt - b.forecast.at)} before it reloads`, { timeoutMs: 10_000 })
+  }
+  // Windows past their reset are dropped, so the list stays a handful long.
+  if (fresh.length) await $.store.set(WARNED, [...warned.filter(id => Date.parse(id.split('@')[1] ?? '') > at), ...fresh])
+}
+
 const now = atom({ plugin: 'usage-panel', key: 'now' } as const, 0)
 const exportsList = atom({ plugin: 'usage-panel', key: 'exports' } as const, [] as ContextExport[])
 const contextNote = atom({ plugin: 'usage-panel', key: 'contextNote' } as const, '')
+const compact = atom({ plugin: 'usage-panel', key: 'compact' } as const, null as CompactPoint | null)
+const cacheTtl = atom({ plugin: 'usage-panel', key: 'cacheTtl' } as const, '5m' as CacheTtl)
+
+// The cache lifetime, in the store: it is the account's, learned once for every session.
+const TTL = 'cache-ttl'
+
+/** Where the context compacts: /context's window less its compaction buffer, estimated locally. */
+async function measureCompact($: EngineInterface): Promise<void> {
+  try {
+    const b = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+    if (!b) return
+    const buffer = b.categories.find(c => c.kind === 'buffer')?.tokens ?? 0
+    await update($, compact, () => ({ tokens: b.rawMaxTokens - buffer, isAuto: buffer > 0 }))
+  } catch {
+    // No session bound yet: the next turn measures it.
+  }
+}
+
+/** The prompts shown in Costliest prompts. */
+const TOP = 5
 
 // ---- bookkeeping ------------------------------------------------------------------
 
@@ -215,6 +257,21 @@ async function importContext($: EngineInterface, x: ContextExport): Promise<void
 const fmtStamp = (ms: number): string =>
   new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })
 
+/** Why a prompt cost more than its tokens suggest: its first call rewrote the cache. */
+const rewriteNote = (p: PromptRun, costUsd: number): string | undefined => {
+  const r = p.cacheRewrite
+  if (!r) return undefined
+  const why = r.idleMs > 5 * 60_000 ? `after ${fmtTime(r.idleMs)} idle (the cache lasts ${r.ttl})` : 'as the conversation changed (a compaction or model switch)'
+  return `Cache rewritten ${why}: ${fmtTokens(r.tokens)} tokens, ≈${fmtUsd(rewriteUsd(r.tokens, r.ttl, promptTokens(p), costUsd))} of this prompt`
+}
+
+/** The band's cache countdown: warm while the next prompt still reads it; cold once it lapsed. */
+const cacheLabel = (list: PromptRun[], ttl: CacheTtl, at: number): { label: string; isWarm: boolean } | undefined => {
+  const left = warmFor(list, ttl, at)
+  if (left === undefined) return undefined
+  return left > 0 ? { label: `cache warm ${fmtTime(left)}`, isWarm: true } : { label: 'cache cold', isWarm: false }
+}
+
 async function togglePane($: EngineInterface): Promise<boolean> {
   if ((await $.ui.panes()).some(p => p.id === PANE)) {
     await $.ui.close({ id: PANE })
@@ -251,14 +308,20 @@ export const register: Register = on => {
     } catch {
       // No figures yet: the first session.measure fills them.
     }
-    // Once a second: saves rows seen drawn, and ticks running clocks; when nothing runs, once a
-    // minute, for the reload countdown.
+    const ttl = (await $.store.get(TTL)) as CacheTtl | undefined
+    if (ttl) await update($, cacheTtl, () => ttl)
+    void measureCompact($)
+    // Once a second: saves rows seen drawn, and ticks running clocks and the cache's countdown;
+    // when nothing runs and the cache has lapsed, once a minute, for the reload countdown.
     $.clock.every(1000, () => {
       void (async () => {
         await saveDrawn($)
         const at = await $.clock.now()
-        const isRunning = (await read($, prompts)).some(p => p.status === 'running' || p.agents.some(a => a.status === 'running'))
-        if (!isRunning && Math.floor(at / 60_000) === Math.floor((await read($, now)) / 60_000)) return
+        const list = await read($, prompts)
+        const isRunning = list.some(p => p.status === 'running' || p.agents.some(a => a.status === 'running'))
+        // A second past the lapse too, so the band turns cold on time.
+        const isWarm = (warmFor(list, await read($, cacheTtl), at) ?? -Infinity) > -1000
+        if (!isRunning && !isWarm && Math.floor(at / 60_000) === Math.floor((await read($, now)) / 60_000)) return
         await update($, now, () => at)
       })()
     })
@@ -291,6 +354,7 @@ export const register: Register = on => {
       const kept = await readSamples($)
       const moved = addSamples(kept, figures(e).rateLimits, at)
       if (JSON.stringify(moved) !== JSON.stringify(kept)) await $.store.set(SAMPLES, moved)
+      await warnPace($, figures(e).rateLimits, moved, at)
     }
     return result
   })
@@ -349,6 +413,7 @@ export const register: Register = on => {
 
   // Every model call, main loop or subagent: tokens, model and the tools it asked for.
   on('turn.step', async function* ($, e, next) {
+    const calledAt = await $.clock.now()
     const result = yield* next(e)
     const usage = result.usage
     const tools = result.toolUses.length
@@ -371,6 +436,22 @@ export const register: Register = on => {
         })).map(p => (p.agents.some(a => a.id === id) ? { ...p, models: useModel(p.models ?? [], model, usage, id) } : p)),
       )
     } else {
+      const at = await $.clock.now()
+      // The prompt's first call: did the cache still hold the conversation since the last call?
+      const mine = held.find(p => p.turnId === e.turnId)
+      const before = mine && mine.calls === 0 ? lastCallOf(held.filter(p => p !== mine)) : undefined
+      let rewrite: PromptRun['cacheRewrite']
+      if (usage && before !== undefined) {
+        const t = add(zero(), usage)
+        const idleMs = calledAt - before
+        const ttl = await read($, cacheTtl)
+        const learned = learnTtl(ttl, idleMs, !isRewrite(t))
+        if (learned !== ttl) {
+          await update($, cacheTtl, () => learned)
+          await $.store.set(TTL, learned)
+        }
+        if (isRewrite(t)) rewrite = { tokens: t.cacheWrite, idleMs, ttl: learned }
+      }
       await update($, prompts, list =>
         list.map(p =>
           p.turnId !== e.turnId
@@ -382,6 +463,11 @@ export const register: Register = on => {
                 tools: p.tools + tools,
                 tokens: usage ? add(p.tokens, usage) : p.tokens,
                 models: useModel(p.models ?? [], model, usage),
+                lastCallAt: at,
+                contextAfter: usage
+                  ? usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
+                  : p.contextAfter,
+                cacheRewrite: rewrite ?? p.cacheRewrite,
               },
         ),
       )
@@ -423,6 +509,7 @@ export const register: Register = on => {
       await update($, prompts, list =>
         list.map(p => (p.turnId === e.turnId ? { ...p, status, endedAt: at, costAtEnd: costUsd } : p)),
       )
+      await measureCompact($)
     }
     await update($, now, () => at)
     return result
@@ -466,6 +553,10 @@ export const register: Register = on => {
 
     const exportsShown = await read($, exportsList)
     const ctxNote = await read($, contextNote)
+    const comp = await read($, compact)
+    const growth = comp && s.contextTokens !== undefined ? promptsUntil(list, s.contextTokens, comp.tokens) : undefined
+    const forecast = growth && comp ? { ...growth, isAuto: comp.isAuto } : undefined
+    const top = costliest(list, costOf, TOP).map(r => ({ ...r, tokens: total(promptTokens(r.p)) }))
 
     // Context: export the conversation to a file, or read an export back in. The same on every surface.
     const contextSection = (
@@ -505,15 +596,17 @@ export const register: Register = on => {
     if (e.surface !== 'terminal' && 'Svg' in ui) {
       const { Svg } = ui
       const W = Math.max(260, Math.min(900, (e.props.bodyColumns || 48) * 8 - 8))
-      const tiles = sessionTiles(W, s, { now: at, prompts: promptRows.length, calls: convo })
+      const tiles = sessionTiles(W, s, { now: at, prompts: promptRows.length, calls: convo, compact: forecast })
       const card = focus
         ? promptCard(W, focus, promptTokens(focus), {
             costUsd: costOf(focus),
             elapsedMs: elapsed(focus),
             calls: calls(focus),
             tools: tools(focus),
+            note: rewriteNote(focus, costOf(focus)),
           })
         : null
+      const topDrawn = top.length >= 2 ? topCard(W, top, at) : null
       return (
         <Box flexDirection="column" gap={1}>
           <Svg key="tiles" source={tiles.source} alt={tiles.alt} width={W} height={tiles.height} />
@@ -540,6 +633,12 @@ export const register: Register = on => {
                   />
                 )
               })}
+            </Box>
+          )}
+          {topDrawn && (
+            <Box flexDirection="column">
+              <Text bold>Costliest prompts</Text>
+              <Svg key="top" source={topDrawn.source} alt={topDrawn.alt} width={W} height={topDrawn.height} />
             </Box>
           )}
           {s.rateLimits.length > 0 && (
@@ -594,6 +693,16 @@ export const register: Register = on => {
             <Text dimColor>{s.contextTokens !== undefined ? ` · ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextWindow)}` : ''}</Text>
           </Text>
         )}
+        {forecast && (
+          <Text wrap="truncate-end">
+            {'  '}
+            <Text bold color={forecast.prompts <= 2 ? 'yellow' : undefined}>
+              ~{forecast.prompts} prompt{forecast.prompts === 1 ? '' : 's'}
+            </Text>{' '}
+            until {forecast.isAuto ? 'auto-compact' : 'the context is full'}
+            <Text dimColor> · +{fmtTokens(forecast.perPrompt)} per prompt</Text>
+          </Text>
+        )}
         {s.rateLimits.map(r => (
           <Text key={r.kind} wrap="truncate-end">
             {'  '}
@@ -619,6 +728,12 @@ export const register: Register = on => {
               <Text dimColor wrap="truncate-end">
                 {'  '}cache hit {hit === undefined ? '—' : `${Math.round(hit)}%`} · {calls(focus) ? fmtTokens(total(t) / calls(focus)) : '—'} per call
               </Text>
+              {focus.cacheRewrite && (
+                <Text color="yellow" wrap="wrap">
+                  {'  '}
+                  {rewriteNote(focus, costOf(focus))}
+                </Text>
+              )}
               <Text>{'  '}Models</Text>
               {focus.models.length ? (
                 focus.models.map(m => (
@@ -655,6 +770,18 @@ export const register: Register = on => {
             <Text dimColor>{'  '}Send a prompt to see its tokens, models and subagents.</Text>
           )}
         </Box>
+        {top.length >= 2 && (
+          <Box marginTop={1} flexDirection="column">
+            <Text bold>Costliest prompts</Text>
+            {top.map(({ p, usd, tokens }, i) => (
+              <Text key={`top:${p.turnId}`} wrap="truncate-end">
+                {'  '}
+                {i + 1}. <Text bold>{fmtUsd(usd).padStart(6)}</Text> “{oneLine(p.text, cols - 30) || '(no text)'}”
+                <Text dimColor> · {fmtTokens(tokens)} tok · {fmtTime(elapsed(p))}</Text>
+              </Text>
+            ))}
+          </Box>
+        )}
         {s.rateLimits.length > 0 && (
           <Box marginTop={1} flexDirection="column">
             <Text bold>Burn rate</Text>
@@ -701,7 +828,9 @@ export const register: Register = on => {
     const cost = Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
     const mainModel = mainModelOf(p)
     const others = p.models.filter(m => m.model !== mainModel).map(m => modelName(m.model))
-    const alt = `${mainModel || 'no model yet'}${others.length ? ` + ${others.join(', ')}` : ''}: ${fmtTokens(total(t))} tokens (${fmtTokens(t.output)} out), ${fmtTime(elapsedMs)}, ≈${fmtUsd(cost)}`
+    // The cache's countdown once the prompt is done: while it runs, every call keeps it warm.
+    const cache = p.status === 'running' ? undefined : cacheLabel(list, await read($, cacheTtl), Math.max(at, await $.clock.now()))
+    const alt = `${mainModel || 'no model yet'}${others.length ? ` + ${others.join(', ')}` : ''}: ${fmtTokens(total(t))} tokens (${fmtTokens(t.output)} out), ${fmtTime(elapsedMs)}, ≈${fmtUsd(cost)}${cache ? `, ${cache.label}` : ''}`
 
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
@@ -710,7 +839,7 @@ export const register: Register = on => {
     if (e.surface !== 'terminal' && 'Svg' in ui) {
       const { Svg } = ui
       const W = Math.max(220, Math.min(1400, (e.props.bodyColumns || 100) * 8 - 72))
-      const row = bandRow(W, p, t, elapsedMs, cost)
+      const row = bandRow(W, p, t, elapsedMs, cost, cache)
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" alignItems="center" gap={1}>
@@ -738,6 +867,14 @@ export const register: Register = on => {
           <Text dimColor>
             {fmtTime(elapsedMs)} · ≈{fmtUsd(cost)}
           </Text>
+          {cache && (
+            <Box flexDirection="row" gap={1}>
+              <Text>│</Text>
+              <Text color={cache.isWarm ? 'cyan' : undefined} dimColor={!cache.isWarm}>
+                {cache.label}
+              </Text>
+            </Box>
+          )}
           {open}
         </Box>
         {below}
