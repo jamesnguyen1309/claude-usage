@@ -2,7 +2,7 @@
 
 # 📊 claude-usage
 
-**See what every prompt costs you in Claude Code: tokens, models and subagents, live.**
+**See what every prompt costs you in Claude Code: tokens, models, subagents, the prompt cache and your rate limits, live.**
 
 `usage-panel` is a Claude Code mod: a live **Usage** pane beside the conversation and a one-line band above the prompt input.
 
@@ -62,11 +62,19 @@ One line for the prompt in progress (or the last one):
 
 | Section | Shows |
 | --- | --- |
-| **Statistics** | when your tokens next reload (a countdown to the soonest rate-limit reset, and which window it is), model calls and tool calls across the conversation (main and subagents), prompts sent, session cost, context window fill and how many prompts until auto-compact at the recent growth per prompt (*~6 prompts*), and the 5-hour and 7-day limits with when each resets; meters turn amber at 70% and red at 90% |
-| **This prompt** | total tokens, then figures for input, output, cache reads, cache writes, the cache hit rate and tokens per call; each model that worked on it: name, id, calls, tokens, its share of the prompt's tokens, and whether it ran the main conversation or subagents; when its first call had to write the whole conversation to the cache again, a line in amber says why and what that cost: *Cache rewritten after 12m 04s idle (the cache lasts 5m): 180k tokens, ≈$0.40 of this prompt* |
-| **Subagents** | each subagent the prompt started, nested under the one that started it, with live status, model, time, calls, tools and tokens |
-| **Costliest prompts** | the five finished prompts of this session that cost the most, costliest first: what you asked, its cost, tokens and time |
-| **Burn rate** | for the 5-hour and 7-day limits: how fast each is being used (% per hour, % per day), and where that pace leads: *Hits 100% at 14:52, 1h 22m before it reloads* in red, or *On pace for 71% when it reloads* otherwise. A small chart shows the window so far, solid, and the pace carried on to the reload, dashed. Readings are kept across sessions, since the limits are your account's. When a window's pace first means it runs out before it reloads, a toast says so, even with the pane closed: once per window, whichever session sees it first. |
+| **Statistics** | when your tokens next reload (a countdown to the soonest rate-limit reset, and which window), model and tool calls across the conversation, prompts sent, session cost, context window fill, how many prompts until auto-compact at your recent growth per prompt (*~6 prompts · +20k per prompt*), and the 5-hour and 7-day limits with when each resets. Meters turn amber at 70% and red at 90%. |
+| **This prompt** | total tokens; input, output, cache reads and writes, the cache hit rate and tokens per call; each model that worked on it, with its id, calls, tokens, share of the prompt and whether it ran the main conversation or subagents |
+| **Subagents** | each subagent the prompt started, nested under the one that started it: live status, model, time, calls, tools and tokens |
+| **Costliest prompts** | the session's five most expensive finished prompts, costliest first: what you asked, its cost, tokens and time |
+| **Burn rate** | for the 5-hour and 7-day limits, how fast each is being used (% per hour, % per day) and where that pace leads: *Hits 100% at 14:52, 1h 22m before it reloads* in red, or *On pace for 71% when it reloads*. A small chart shows the window so far, solid, and the pace carried on, dashed. |
+
+### Warnings
+
+| When | You see |
+| --- | --- |
+| A rate-limit window's pace means it runs out before it reloads | a toast, even with the pane closed: *5-hour limit: on pace to hit 100% at 14:52, 20m before it reloads*. Once per window, whichever session notices first. |
+| A prompt had to write the whole conversation to the cache again | an amber line on its card saying why and what it cost: *Cache rewritten after 12m 04s idle (the cache lasts 5m): 180k tokens, ≈$0.40 of this prompt* |
+| Only a couple of prompts are left before auto-compact | the forecast turns amber |
 
 While Claude works, a little animated Claude (the orange pixel crab, stepping and waving) marks what is running: the prompt card, each subagent and the band. The desktop app draws cards, bars and chips; a terminal gets the same figures as text. `/usage-panel` shows or hides the pane.
 
@@ -82,6 +90,12 @@ claude plugin uninstall usage-panel@claude-usage
 
 Start a new session afterwards for the change to load.
 
+Installed before the GitHub account was renamed? `claude plugin marketplace update` will show it cloning from `jamesbrad1309/claude-usage`. That still works through GitHub's redirect, but to point it at the current name, add the marketplace again (this resets the mod's saved burn-rate readings and learned cache lifetime):
+
+```bash
+claude plugin marketplace remove claude-usage && claude plugin marketplace add jamesnguyen1309/claude-usage && claude plugin install usage-panel@claude-usage --scope user
+```
+
 ## 📐 How the figures are counted
 
 - **Tokens** come from each model call's usage as the API reports it, main conversation and subagents together. Cache reads usually dominate: each call re-reads the conversation from cache, at a fraction of the price of fresh input.
@@ -89,9 +103,9 @@ Start a new session afterwards for the change to load.
 - **The cache's lifetime** isn't reported by Claude Code, so the mod learns it: 5 minutes to begin with, an hour once a prompt reads the cache after more than 5 idle minutes (and 5 again if one then finds it gone). It is kept across sessions.
 - **A cache rewrite's cost** is its share of the prompt's cost, with each kind of token weighed by its price relative to fresh input (output 5×, cache read 0.1×, cache write 1.25× or 2× for the hour-long cache). Subagents on cheaper models make it a slight overestimate.
 - **Prompts until auto-compact** compares the context with the point where it compacts, the window less the compaction buffer as `/context` shows them, at the average growth over your last few prompts.
-- **Per session:** each session shows only its own prompts. Nothing leaves your machine.
-- Prompts sent before the mod loaded are listed once the conversation has drawn them, without figures.
-- The list doesn't jump to a prompt in the conversation: the desktop app doesn't let mods scroll its conversation (Claude Code answers *transcript not scrollable here*).
+- **Burn-rate readings** are kept across sessions, since the limits are your account's; readings older than 8 days are dropped.
+- **Per session:** each session shows only its own prompts, and keeps its latest 50 (Costliest prompts picks from those). *Prompts sent* also counts the ones sent before the mod loaded, once the conversation has drawn them.
+- **Nothing leaves your machine:** the mod reads Claude Code's own figures, and reads or writes no files.
 
 ## 🛠 Develop
 
@@ -105,10 +119,11 @@ claude --plugin-dir .      # run a session with this working copy
 | --- | --- |
 | `hooks/register.tsx` | the hooks: bookkeeping, the pane, the band, the terminal views |
 | `hooks/draw.ts` | the desktop drawings (SVG) |
+| `hooks/burn.ts` | the burn rate and its forecast |
 | `hooks/cache.ts` | the cache countdown and rewrites, the auto-compact forecast, the costliest prompts |
 | `types/index.d.ts` | the state contract |
 | `tests/usage-panel.test.ts` | behaviour tests |
 | `install.sh` | installs or updates the mod on a device |
 | `.claude-plugin/` | the mod's manifest and the marketplace that lists it |
 
-To release: bump `version` in both `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`, push, then update on each device.
+To release: bump `version` in `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` and the README's version badge, push, then update on each device. Installed copies only update when the version changes.
