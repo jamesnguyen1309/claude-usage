@@ -12,6 +12,20 @@
 
 ---
 
+## 👀 Preview
+
+**The band above the prompt input**, while a prompt runs:
+
+<img src=".github/screenshots/band.png" alt="The band above the prompt input: the main model Opus 5.5 with subagent chips for Haiku 5.5 and Sonnet 5.5, 596k tokens, 9k out, 1m 12s, about $0.61, and the Usage button" width="100%">
+
+**The Usage pane** beside the conversation:
+
+<p align="center">
+<img src=".github/screenshots/pane.png" alt="The Usage pane: statistics tiles, the prompt in progress with its tokens and models, nested subagents, the costliest prompts and burn-rate charts for the 5-hour and 7-day limits" width="420">
+</p>
+
+<sub>Screenshots of the desktop app, drawn from made-up demo data. A terminal gets the same figures as text.</sub>
+
 ## ⚡ Install
 
 On each device, in any shell:
