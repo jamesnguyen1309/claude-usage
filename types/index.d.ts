@@ -108,6 +108,8 @@ declare module 'claude-code' {
       compact: CompactPoint | null
       /** The cache lifetime the mod has learned, mirrored from the store for the drawings. */
       cacheTtl: CacheTtl
+      /** Whether the terminal's floating bar shows the full report. */
+      barOpen: boolean
     }
   }
 }

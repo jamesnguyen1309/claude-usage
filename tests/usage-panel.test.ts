@@ -445,3 +445,30 @@ test('the strip names the main conversation’s model, not a subagent’s or a s
   expect(await term.find({ type: 'Text', text: 'Opus 5.5' })).toBeDefined()
   await term.unmount()
 })
+
+test('in the terminal the band is a framed bar that unfolds the full report', async ($, on) => {
+  engine(on)
+  on('session.measure', async () => ({ changed: [] }) as never)
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, { key: 'beneath' }, '') as never
+  })
+  await $.turn.start({ text: 'Plan the AWS deploy', turnId: 't1' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+  await $.session.measure({ context: { tokens: 50_000, window: 200_000, percent: 25 }, rateLimits: [{ kind: 'five_hour', percentUsed: 42 }], cost: { usd: 1.25 }, changed: ['cost'] } as never)
+
+  let bar = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  expect((await bar.findAll({ type: 'Box' })).some(b => b.props.borderStyle === 'round')).toBe(true)
+  const folded = await bandText(bar)
+  expect(folded).toMatch(/Opus 5\.5/)
+  expect(folded).toMatch(/Cost.*\$1\.25.*context.*25%.*5-hour.*42%/)
+  expect(folded).not.toMatch(/Statistics/)
+
+  await bar.press({ key: 'usage-toggle' })
+  await bar.unmount()
+  bar = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+  const open = await bandText(bar)
+  expect(open).toMatch(/Statistics/)
+  expect(open).toMatch(/This prompt/)
+  await bar.unmount()
+})

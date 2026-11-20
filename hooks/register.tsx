@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionUsage, TurnUsage } from 'claude-code'
+import type { Elements, EngineInterface, Register, RenderSurface, SessionUsage, TurnUsage } from 'claude-code'
 
 import { addSamples, burnOf } from './burn'
 import { costliest, isRewrite, lastCallOf, learnTtl, promptsUntil, rewriteUsd, warmFor } from './cache'
@@ -67,6 +67,8 @@ async function warnPace($: EngineInterface, limits: RateLimit[], samples: BurnSa
 const now = atom({ plugin: 'usage-panel', key: 'now' } as const, 0)
 const compact = atom({ plugin: 'usage-panel', key: 'compact' } as const, null as CompactPoint | null)
 const cacheTtl = atom({ plugin: 'usage-panel', key: 'cacheTtl' } as const, '5m' as CacheTtl)
+// The terminal's floating bar: the full report shown inside it, or its two lines alone.
+const barOpen = atom({ plugin: 'usage-panel', key: 'barOpen' } as const, false)
 
 // The cache lifetime, in the store: it is the account's, learned once for every session.
 const TTL = 'cache-ttl'
@@ -204,6 +206,16 @@ const cacheLabel = (list: PromptRun[], ttl: CacheTtl, at: number): { label: stri
   return left > 0 ? { label: `cache warm ${fmtTime(left)}`, isWarm: true } : { label: 'cache cold', isWarm: false }
 }
 
+// The desktop app draws the Usage pane; a terminal-only session draws the floating bar instead.
+const hasDesktop = async ($: EngineInterface): Promise<boolean> => (await $.session.surfaces()).includes('desktop')
+
+/** Expands or folds the terminal's floating bar. */
+async function toggleBar($: EngineInterface): Promise<boolean> {
+  const open = !(await read($, barOpen))
+  await update($, barOpen, () => open)
+  return open
+}
+
 async function togglePane($: EngineInterface): Promise<boolean> {
   if ((await $.ui.panes()).some(p => p.id === PANE)) {
     await $.ui.close({ id: PANE })
@@ -222,6 +234,363 @@ async function saveDrawn($: EngineInterface): Promise<void> {
   const batch = drawn
   drawn = []
   await update($, rows, list => batch.reduce((l, r) => addRow(l, { ...r, isDrawn: true }), list))
+}
+
+/** The full report: the pane's body, and the terminal's floating bar when it is expanded. */
+async function report($: EngineInterface, ui: Elements[RenderSurface], surface: RenderSurface, bodyColumns: number) {
+  const { Box, Text } = ui
+  const list = (await read($, prompts)).map(normalize)
+  const s = await read($, session)
+  const promptRows = await read($, rows)
+  const samples = await readSamples($)
+  const convo = (await read($, totals)) ?? seedTotals(list)
+  // `now` subscribes the pane to the ticker; the clock itself is what the burn rate reads against.
+  const at = Math.max(await read($, now), await $.clock.now(), ...list.map(p => p.startedAt), 0)
+
+  const costOf = (p: PromptRun): number =>
+    Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
+  const elapsed = (r: { startedAt: number; endedAt?: number }) => (r.endedAt ?? at) - r.startedAt
+  const calls = (p: PromptRun) => p.calls + p.agents.reduce((n, a) => n + a.calls, 0)
+  const tools = (p: PromptRun) => p.tools + p.agents.reduce((n, a) => n + a.tools, 0)
+
+  // Agents in spawn order, each child right under its parent.
+  const ordered = (agents: AgentRun[]): { a: AgentRun; depth: number }[] => {
+    const ids = new Set(agents.map(a => a.id))
+    const out: { a: AgentRun; depth: number }[] = []
+    const walk = (parent: string | undefined, depth: number) => {
+      for (const a of agents) {
+        const isChild = parent === undefined ? !a.parentId || !ids.has(a.parentId) : a.parentId === parent
+        if (isChild) {
+          out.push({ a, depth })
+          walk(a.id, depth + 1)
+        }
+      }
+    }
+    walk(undefined, 0)
+    return out
+  }
+
+  const comp = await read($, compact)
+  const growth = comp && s.contextTokens !== undefined ? promptsUntil(list, s.contextTokens, comp.tokens) : undefined
+  const forecast = growth && comp ? { ...growth, isAuto: comp.isAuto } : undefined
+  const top = costliest(list, costOf, TOP).map(r => ({ ...r, tokens: total(promptTokens(r.p)) }))
+
+  const latest = list.at(-1)
+  // The prompt card and subagents show the latest prompt.
+  const focus = latest
+  const agents = focus ? ordered(focus.agents) : []
+
+  if (surface !== 'terminal' && 'Svg' in ui) {
+    const { Svg } = ui
+    const W = Math.max(260, Math.min(900, (bodyColumns || 48) * 8 - 8))
+    const tiles = sessionTiles(W, s, { now: at, prompts: promptRows.length, calls: convo, compact: forecast })
+    const card = focus
+      ? promptCard(W, focus, promptTokens(focus), {
+          costUsd: costOf(focus),
+          elapsedMs: elapsed(focus),
+          calls: calls(focus),
+          tools: tools(focus),
+          note: rewriteNote(focus, costOf(focus)),
+        })
+      : null
+    const topDrawn = top.length >= 2 ? topCard(W, top, at) : null
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Svg key="tiles" source={tiles.source} alt={tiles.alt} width={W} height={tiles.height} />
+        {card ? (
+          <Svg key="prompt" source={card.source} alt={card.alt} width={W} height={card.height} />
+        ) : (
+          <Text dimColor>Send a prompt to see its tokens, models and subagents.</Text>
+        )}
+        {agents.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>
+              Subagents · {agents.length}
+              {focus && focus.agents.some(a => a.status === 'running') ? ` (${focus.agents.filter(a => a.status === 'running').length} running)` : ''}
+            </Text>
+            {agents.map(({ a, depth }) => {
+              const r = agentRow(W, a, depth, elapsed(a))
+              return (
+                <Svg
+                  key={`agent:${a.id}`}
+                  source={r.source}
+                  alt={`${a.description || a.type}: ${a.type}, ${modelName(a.model)}, ${a.status}, ${fmtTokens(total(a.tokens))} tokens`}
+                  width={W}
+                  height={r.height}
+                />
+              )
+            })}
+          </Box>
+        )}
+        {topDrawn && (
+          <Box flexDirection="column">
+            <Text bold>Costliest prompts</Text>
+            <Svg key="top" source={topDrawn.source} alt={topDrawn.alt} width={W} height={topDrawn.height} />
+          </Box>
+        )}
+        {s.rateLimits.length > 0 && (
+          <Box flexDirection="column" gap={1}>
+            <Text bold>Burn rate</Text>
+            {s.rateLimits.map(r => {
+              const c = burnCard(W, burnOf(r, samples, at), at)
+              return <Svg key={`burn:${r.kind}`} source={c.source} alt={c.alt} width={W} height={c.height} />
+            })}
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  // Terminal (and the editor and phone): the same content as text.
+  const cols = Math.max(30, bodyColumns || 60)
+  const barW = Math.max(8, Math.min(24, cols - 30))
+  const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
+  const t = focus ? promptTokens(focus) : zero()
+  const reload = nextReset(s, at)
+  const resetOf = (iso?: string) => {
+    const ms = iso ? Date.parse(iso) : NaN
+    return Number.isFinite(ms) ? ` · resets ${fmtResetAt(ms, at)}` : ''
+  }
+  const hit = cacheHit(t)
+
+  return (
+    <Box flexDirection="column">
+      <Text bold>Statistics</Text>
+      {reload && (
+        <Text wrap="truncate-end">
+          {'  '}Tokens reload in <Text bold color="claude">{fmtUntil(reload.at - at)}</Text>
+          <Text dimColor>
+            {' '}
+            · {limitName(reload.kind)} · {fmtResetAt(reload.at, at)}
+          </Text>
+        </Text>
+      )}
+      <Text wrap="truncate-end">
+        {'  '}
+        <Text bold>{convo.modelCalls}</Text> model calls · <Text bold>{convo.toolCalls}</Text> tool calls ·{' '}
+        <Text bold>{promptRows.length}</Text> prompts
+      </Text>
+      <Text>
+        {'  '}Cost <Text bold>{fmtUsd(s.costUsd)}</Text>
+      </Text>
+      {ctxPct !== undefined && (
+        <Text wrap="truncate-end">
+          {'  '}Context <Text color={pctColor(ctxPct)}>{bar(ctxPct, barW)}</Text> {Math.round(ctxPct)}%
+          <Text dimColor>{s.contextTokens !== undefined ? ` · ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextWindow)}` : ''}</Text>
+        </Text>
+      )}
+      {forecast && (
+        <Text wrap="truncate-end">
+          {'  '}
+          <Text bold color={forecast.prompts <= 2 ? 'yellow' : undefined}>
+            ~{forecast.prompts} prompt{forecast.prompts === 1 ? '' : 's'}
+          </Text>{' '}
+          until {forecast.isAuto ? 'auto-compact' : 'the context is full'}
+          <Text dimColor> · +{fmtTokens(forecast.perPrompt)} per prompt</Text>
+        </Text>
+      )}
+      {s.rateLimits.map(r => (
+        <Text key={r.kind} wrap="truncate-end">
+          {'  '}
+          {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text color={pctColor(r.percentUsed)}>{bar(r.percentUsed, barW)}</Text> {Math.round(r.percentUsed)}%
+          <Text dimColor>{resetOf(r.resetsAt)}</Text>
+        </Text>
+      ))}
+
+      <Box marginTop={1} flexDirection="column">
+        <Text bold>This prompt</Text>
+        {focus ? (
+          <Box flexDirection="column">
+            <Text wrap="truncate-end">
+              <Text color={COLOR[focus.status]}>{GLYPH[focus.status]}</Text> “{oneLine(focus.text, cols - 6) || '(no text)'}”
+            </Text>
+            <Text dimColor wrap="truncate-end">
+              {'  '}≈{fmtUsd(costOf(focus))} · {fmtTime(elapsed(focus))} · {calls(focus)} calls · {tools(focus)} tools
+            </Text>
+            <Text wrap="truncate-end">
+              {'  '}Tokens <Text bold>{fmtTokens(total(t))}</Text>
+              <Text dimColor> · {PARTS.map(p => `${p.label} ${fmtTokens(t[p.key])}`).join(' · ')}</Text>
+            </Text>
+            <Text dimColor wrap="truncate-end">
+              {'  '}cache hit {hit === undefined ? '—' : `${Math.round(hit)}%`} · {calls(focus) ? fmtTokens(total(t) / calls(focus)) : '—'} per call
+            </Text>
+            {focus.cacheRewrite && (
+              <Text color="yellow" wrap="wrap">
+                {'  '}
+                {rewriteNote(focus, costOf(focus))}
+              </Text>
+            )}
+            <Text>{'  '}Models</Text>
+            {focus.models.length ? (
+              focus.models.map(m => (
+                <Text key={m.model} wrap="truncate-end">
+                  {'    '}
+                  <Text bold>{modelName(m.model)}</Text>
+                  <Text dimColor>
+                    {' '}
+                    {m.model} · {whereOf(m)} · {m.mainCalls + m.agentCalls} calls · {fmtTokens(total(m.tokens))} tok
+                  </Text>
+                </Text>
+              ))
+            ) : (
+              <Text dimColor>{'    '}waiting for the first model call…</Text>
+            )}
+            {agents.length > 0 && <Text>{'  '}Subagents · {agents.length}</Text>}
+            {agents.map(({ a, depth }) => (
+              <Box key={a.id} flexDirection="column">
+                <Text wrap="truncate-end">
+                  {'    '}
+                  {'  '.repeat(depth)}
+                  <Text color={COLOR[a.status]}>{GLYPH[a.status]}</Text> <Text bold>{a.description || a.type}</Text>
+                  <Text dimColor> · {a.type}</Text>
+                </Text>
+                <Text dimColor wrap="truncate-end">
+                  {'      '}
+                  {'  '.repeat(depth)}
+                  {modelName(a.model)} · {fmtTime(elapsed(a))} · {a.calls} calls · {a.tools} tools · {fmtTokens(total(a.tokens))} tok
+                </Text>
+              </Box>
+            ))}
+          </Box>
+        ) : (
+          <Text dimColor>{'  '}Send a prompt to see its tokens, models and subagents.</Text>
+        )}
+      </Box>
+      {top.length >= 2 && (
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>Costliest prompts</Text>
+          {top.map(({ p, usd, tokens }, i) => (
+            <Text key={`top:${p.turnId}`} wrap="truncate-end">
+              {'  '}
+              {i + 1}. <Text bold>{fmtUsd(usd).padStart(6)}</Text> “{oneLine(p.text, cols - 30) || '(no text)'}”
+              <Text dimColor> · {fmtTokens(tokens)} tok · {fmtTime(elapsed(p))}</Text>
+            </Text>
+          ))}
+        </Box>
+      )}
+      {s.rateLimits.length > 0 && (
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>Burn rate</Text>
+          {s.rateLimits.map(r => {
+            const b = burnOf(r, samples, at)
+            const f = b.forecast
+            const pace = b.rate === undefined ? 'measuring…' : `${b.rate >= 10 ? Math.round(b.rate) : b.rate.toFixed(1)}%/${b.perLabel}`
+            const reset = b.resetAt !== undefined ? fmtResetAt(b.resetAt, at) : ''
+            const [line, color] =
+              f.kind === 'measuring'
+                ? ['shows once the window has moved', undefined]
+                : f.kind === 'idle'
+                  ? [`no use lately, stays at ${Math.round(b.pct)}%`, 'green']
+                  : f.kind === 'hits'
+                    ? [`hits 100% at ${fmtResetAt(f.at, at)}${b.resetAt !== undefined ? `, ${fmtUntil(b.resetAt - f.at)} before reload` : ''}`, 'red']
+                    : [`on pace for ${Math.round(f.atReset)}% at reload ${reset}`.trim(), pctColor(f.atReset)]
+            return (
+              <Text key={`burn:${r.kind}`} wrap="truncate-end">
+                {'  '}
+                {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text bold>{pace}</Text> · <Text color={color}>{line}</Text>
+              </Text>
+            )
+          })}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+/**
+ * The terminal's band: a framed bar floating above the prompt, in place of the pane. Its first
+ * line is the prompt in progress (or the last one), its second the session's figures; the
+ * Usage button unfolds the full report inside it.
+ */
+async function floatingBar($: EngineInterface, ui: Elements[RenderSurface], bodyColumns: number, list: PromptRun[], below: unknown) {
+  const { Box, Text, Button } = ui
+  const s = await read($, session)
+  const isOpen = await read($, barOpen)
+  const last = list.at(-1)
+  const at = Math.max(await read($, now), last?.startedAt ?? 0)
+  // Inside the frame: its two borders and one cell of padding each side.
+  const cols = Math.max(30, (bodyColumns || 100) - 4)
+  const toggle = <Button key="usage-toggle" label={isOpen ? 'Less' : 'Usage'} plain onPress={() => void toggleBar($)} />
+
+  let promptLine = <Text dimColor>Send a prompt to see its tokens, models and cost.</Text>
+  if (last) {
+    const p = normalize(last)
+    const t = promptTokens(p)
+    const elapsedMs = (p.endedAt ?? at) - p.startedAt
+    const cost = Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
+    const mainModel = mainModelOf(p)
+    const others = p.models.filter(m => m.model !== mainModel).map(m => modelName(m.model))
+    // The cache's countdown once the prompt is done: while it runs, every call keeps it warm.
+    const cache = p.status === 'running' ? undefined : cacheLabel(list, await read($, cacheTtl), Math.max(at, await $.clock.now()))
+    promptLine = (
+      <Box flexDirection="row" gap={1}>
+        <Text color={COLOR[p.status]}>{GLYPH[p.status]}</Text>
+        <Text bold>{mainModel ? modelName(mainModel) : '—'}</Text>
+        <Text dimColor wrap="truncate-end">
+          {mainModel}
+          {others.length ? ` +${others.join(', +')}` : ''}
+        </Text>
+        <Text>│</Text>
+        <Text bold>{fmtTokens(total(t))} tokens</Text>
+        <Text dimColor>({fmtTokens(t.output)} out)</Text>
+        <Text>│</Text>
+        <Text dimColor>
+          {fmtTime(elapsedMs)} · ≈{fmtUsd(cost)}
+        </Text>
+        {cache && (
+          <Box flexDirection="row" gap={1}>
+            <Text>│</Text>
+            <Text color={cache.isWarm ? 'cyan' : undefined} dimColor={!cache.isWarm}>
+              {cache.label}
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  const reload = nextReset(s, at)
+  const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
+  const summary = (
+    <Text wrap="truncate-end">
+      {reload ? (
+        <Text>
+          Reload in <Text bold color="claude">{fmtUntil(reload.at - at)}</Text>
+          <Text dimColor> · </Text>
+        </Text>
+      ) : null}
+      Cost <Text bold>{fmtUsd(s.costUsd)}</Text>
+      {ctxPct !== undefined && (
+        <Text>
+          <Text dimColor> · </Text>context <Text color={pctColor(ctxPct)}>{bar(ctxPct, 8)}</Text> {Math.round(ctxPct)}%
+        </Text>
+      )}
+      {s.rateLimits.map(r => (
+        <Text key={`limit:${r.kind}`}>
+          <Text dimColor> · </Text>
+          {LIMIT_NAME[r.kind] ?? r.kind} <Text color={pctColor(r.percentUsed)}>{Math.round(r.percentUsed)}%</Text>
+        </Text>
+      ))}
+    </Text>
+  )
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+        <Box flexDirection="row" justifyContent="space-between" gap={1}>
+          {promptLine}
+          {toggle}
+        </Box>
+        {summary}
+        {isOpen && (
+          <Box marginTop={1} flexDirection="column">
+            {await report($, ui, 'terminal', cols)}
+          </Box>
+        )}
+      </Box>
+      {below as never}
+    </Box>
+  )
 }
 
 export const register: Register = on => {
@@ -257,13 +626,22 @@ export const register: Register = on => {
         await update($, now, () => at)
       })()
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    if (await hasDesktop($)) void $.ui.open({ id: PANE, title: TITLE })
     return started
   })
 
-  on('command.run', { command: 'usage-panel' }, async $ => ({
-    text: (await togglePane($)) ? 'Usage pane opened.' : 'Usage pane closed.',
-  }))
+  // The desktop app may attach after the session started: it gets the pane then.
+  on('session.attach', { surface: 'desktop' }, async ($, e, next) => {
+    const result = await next(e)
+    void $.ui.open({ id: PANE, title: TITLE })
+    return result
+  })
+
+  on('command.run', { command: 'usage-panel' }, async $ =>
+    (await hasDesktop($))
+      ? { text: (await togglePane($)) ? 'Usage pane opened.' : 'Usage pane closed.' }
+      : { text: (await toggleBar($)) ? 'Usage bar expanded.' : 'Usage bar folded.' },
+  )
 
   // /clear starts the session over.
   on('session.end', async ($, e, next) => {
@@ -448,273 +826,16 @@ export const register: Register = on => {
 
   // ---- the pane -------------------------------------------------------------------
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const ui = $.ui.resolve(e)
-    const { Box, Text } = ui
-    const list = (await read($, prompts)).map(normalize)
-    const s = await read($, session)
-    const promptRows = await read($, rows)
-    const samples = await readSamples($)
-    const convo = (await read($, totals)) ?? seedTotals(list)
-    // `now` subscribes the pane to the ticker; the clock itself is what the burn rate reads against.
-    const at = Math.max(await read($, now), await $.clock.now(), ...list.map(p => p.startedAt), 0)
-
-    const costOf = (p: PromptRun): number =>
-      Math.max(0, (p.costAtEnd ?? (p.status === 'running' ? s.costUsd : p.costAtStart)) - p.costAtStart)
-    const elapsed = (r: { startedAt: number; endedAt?: number }) => (r.endedAt ?? at) - r.startedAt
-    const calls = (p: PromptRun) => p.calls + p.agents.reduce((n, a) => n + a.calls, 0)
-    const tools = (p: PromptRun) => p.tools + p.agents.reduce((n, a) => n + a.tools, 0)
-
-    // Agents in spawn order, each child right under its parent.
-    const ordered = (agents: AgentRun[]): { a: AgentRun; depth: number }[] => {
-      const ids = new Set(agents.map(a => a.id))
-      const out: { a: AgentRun; depth: number }[] = []
-      const walk = (parent: string | undefined, depth: number) => {
-        for (const a of agents) {
-          const isChild = parent === undefined ? !a.parentId || !ids.has(a.parentId) : a.parentId === parent
-          if (isChild) {
-            out.push({ a, depth })
-            walk(a.id, depth + 1)
-          }
-        }
-      }
-      walk(undefined, 0)
-      return out
-    }
-
-    const comp = await read($, compact)
-    const growth = comp && s.contextTokens !== undefined ? promptsUntil(list, s.contextTokens, comp.tokens) : undefined
-    const forecast = growth && comp ? { ...growth, isAuto: comp.isAuto } : undefined
-    const top = costliest(list, costOf, TOP).map(r => ({ ...r, tokens: total(promptTokens(r.p)) }))
-
-    const latest = list.at(-1)
-    // The prompt card and subagents show the latest prompt.
-    const focus = latest
-    const agents = focus ? ordered(focus.agents) : []
-
-    if (e.surface !== 'terminal' && 'Svg' in ui) {
-      const { Svg } = ui
-      const W = Math.max(260, Math.min(900, (e.props.bodyColumns || 48) * 8 - 8))
-      const tiles = sessionTiles(W, s, { now: at, prompts: promptRows.length, calls: convo, compact: forecast })
-      const card = focus
-        ? promptCard(W, focus, promptTokens(focus), {
-            costUsd: costOf(focus),
-            elapsedMs: elapsed(focus),
-            calls: calls(focus),
-            tools: tools(focus),
-            note: rewriteNote(focus, costOf(focus)),
-          })
-        : null
-      const topDrawn = top.length >= 2 ? topCard(W, top, at) : null
-      return (
-        <Box flexDirection="column" gap={1}>
-          <Svg key="tiles" source={tiles.source} alt={tiles.alt} width={W} height={tiles.height} />
-          {card ? (
-            <Svg key="prompt" source={card.source} alt={card.alt} width={W} height={card.height} />
-          ) : (
-            <Text dimColor>Send a prompt to see its tokens, models and subagents.</Text>
-          )}
-          {agents.length > 0 && (
-            <Box flexDirection="column">
-              <Text bold>
-                Subagents · {agents.length}
-                {focus && focus.agents.some(a => a.status === 'running') ? ` (${focus.agents.filter(a => a.status === 'running').length} running)` : ''}
-              </Text>
-              {agents.map(({ a, depth }) => {
-                const r = agentRow(W, a, depth, elapsed(a))
-                return (
-                  <Svg
-                    key={`agent:${a.id}`}
-                    source={r.source}
-                    alt={`${a.description || a.type}: ${a.type}, ${modelName(a.model)}, ${a.status}, ${fmtTokens(total(a.tokens))} tokens`}
-                    width={W}
-                    height={r.height}
-                  />
-                )
-              })}
-            </Box>
-          )}
-          {topDrawn && (
-            <Box flexDirection="column">
-              <Text bold>Costliest prompts</Text>
-              <Svg key="top" source={topDrawn.source} alt={topDrawn.alt} width={W} height={topDrawn.height} />
-            </Box>
-          )}
-          {s.rateLimits.length > 0 && (
-            <Box flexDirection="column" gap={1}>
-              <Text bold>Burn rate</Text>
-              {s.rateLimits.map(r => {
-                const c = burnCard(W, burnOf(r, samples, at), at)
-                return <Svg key={`burn:${r.kind}`} source={c.source} alt={c.alt} width={W} height={c.height} />
-              })}
-            </Box>
-          )}
-        </Box>
-      )
-    }
-
-    // Terminal (and the editor and phone): the same content as text.
-    const cols = Math.max(30, e.props.bodyColumns || 60)
-    const barW = Math.max(8, Math.min(24, cols - 30))
-    const ctxPct = s.contextPercent ?? (s.contextTokens && s.contextWindow ? (s.contextTokens / s.contextWindow) * 100 : undefined)
-    const t = focus ? promptTokens(focus) : zero()
-    const reload = nextReset(s, at)
-    const resetOf = (iso?: string) => {
-      const ms = iso ? Date.parse(iso) : NaN
-      return Number.isFinite(ms) ? ` · resets ${fmtResetAt(ms, at)}` : ''
-    }
-    const hit = cacheHit(t)
-
-    return (
-      <Box flexDirection="column">
-        <Text bold>Statistics</Text>
-        {reload && (
-          <Text wrap="truncate-end">
-            {'  '}Tokens reload in <Text bold color="claude">{fmtUntil(reload.at - at)}</Text>
-            <Text dimColor>
-              {' '}
-              · {limitName(reload.kind)} · {fmtResetAt(reload.at, at)}
-            </Text>
-          </Text>
-        )}
-        <Text wrap="truncate-end">
-          {'  '}
-          <Text bold>{convo.modelCalls}</Text> model calls · <Text bold>{convo.toolCalls}</Text> tool calls ·{' '}
-          <Text bold>{promptRows.length}</Text> prompts
-        </Text>
-        <Text>
-          {'  '}Cost <Text bold>{fmtUsd(s.costUsd)}</Text>
-        </Text>
-        {ctxPct !== undefined && (
-          <Text wrap="truncate-end">
-            {'  '}Context <Text color={pctColor(ctxPct)}>{bar(ctxPct, barW)}</Text> {Math.round(ctxPct)}%
-            <Text dimColor>{s.contextTokens !== undefined ? ` · ${fmtTokens(s.contextTokens)} / ${fmtTokens(s.contextWindow)}` : ''}</Text>
-          </Text>
-        )}
-        {forecast && (
-          <Text wrap="truncate-end">
-            {'  '}
-            <Text bold color={forecast.prompts <= 2 ? 'yellow' : undefined}>
-              ~{forecast.prompts} prompt{forecast.prompts === 1 ? '' : 's'}
-            </Text>{' '}
-            until {forecast.isAuto ? 'auto-compact' : 'the context is full'}
-            <Text dimColor> · +{fmtTokens(forecast.perPrompt)} per prompt</Text>
-          </Text>
-        )}
-        {s.rateLimits.map(r => (
-          <Text key={r.kind} wrap="truncate-end">
-            {'  '}
-            {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text color={pctColor(r.percentUsed)}>{bar(r.percentUsed, barW)}</Text> {Math.round(r.percentUsed)}%
-            <Text dimColor>{resetOf(r.resetsAt)}</Text>
-          </Text>
-        ))}
-
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>This prompt</Text>
-          {focus ? (
-            <Box flexDirection="column">
-              <Text wrap="truncate-end">
-                <Text color={COLOR[focus.status]}>{GLYPH[focus.status]}</Text> “{oneLine(focus.text, cols - 6) || '(no text)'}”
-              </Text>
-              <Text dimColor wrap="truncate-end">
-                {'  '}≈{fmtUsd(costOf(focus))} · {fmtTime(elapsed(focus))} · {calls(focus)} calls · {tools(focus)} tools
-              </Text>
-              <Text wrap="truncate-end">
-                {'  '}Tokens <Text bold>{fmtTokens(total(t))}</Text>
-                <Text dimColor> · {PARTS.map(p => `${p.label} ${fmtTokens(t[p.key])}`).join(' · ')}</Text>
-              </Text>
-              <Text dimColor wrap="truncate-end">
-                {'  '}cache hit {hit === undefined ? '—' : `${Math.round(hit)}%`} · {calls(focus) ? fmtTokens(total(t) / calls(focus)) : '—'} per call
-              </Text>
-              {focus.cacheRewrite && (
-                <Text color="yellow" wrap="wrap">
-                  {'  '}
-                  {rewriteNote(focus, costOf(focus))}
-                </Text>
-              )}
-              <Text>{'  '}Models</Text>
-              {focus.models.length ? (
-                focus.models.map(m => (
-                  <Text key={m.model} wrap="truncate-end">
-                    {'    '}
-                    <Text bold>{modelName(m.model)}</Text>
-                    <Text dimColor>
-                      {' '}
-                      {m.model} · {whereOf(m)} · {m.mainCalls + m.agentCalls} calls · {fmtTokens(total(m.tokens))} tok
-                    </Text>
-                  </Text>
-                ))
-              ) : (
-                <Text dimColor>{'    '}waiting for the first model call…</Text>
-              )}
-              {agents.length > 0 && <Text>{'  '}Subagents · {agents.length}</Text>}
-              {agents.map(({ a, depth }) => (
-                <Box key={a.id} flexDirection="column">
-                  <Text wrap="truncate-end">
-                    {'    '}
-                    {'  '.repeat(depth)}
-                    <Text color={COLOR[a.status]}>{GLYPH[a.status]}</Text> <Text bold>{a.description || a.type}</Text>
-                    <Text dimColor> · {a.type}</Text>
-                  </Text>
-                  <Text dimColor wrap="truncate-end">
-                    {'      '}
-                    {'  '.repeat(depth)}
-                    {modelName(a.model)} · {fmtTime(elapsed(a))} · {a.calls} calls · {a.tools} tools · {fmtTokens(total(a.tokens))} tok
-                  </Text>
-                </Box>
-              ))}
-            </Box>
-          ) : (
-            <Text dimColor>{'  '}Send a prompt to see its tokens, models and subagents.</Text>
-          )}
-        </Box>
-        {top.length >= 2 && (
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>Costliest prompts</Text>
-            {top.map(({ p, usd, tokens }, i) => (
-              <Text key={`top:${p.turnId}`} wrap="truncate-end">
-                {'  '}
-                {i + 1}. <Text bold>{fmtUsd(usd).padStart(6)}</Text> “{oneLine(p.text, cols - 30) || '(no text)'}”
-                <Text dimColor> · {fmtTokens(tokens)} tok · {fmtTime(elapsed(p))}</Text>
-              </Text>
-            ))}
-          </Box>
-        )}
-        {s.rateLimits.length > 0 && (
-          <Box marginTop={1} flexDirection="column">
-            <Text bold>Burn rate</Text>
-            {s.rateLimits.map(r => {
-              const b = burnOf(r, samples, at)
-              const f = b.forecast
-              const pace = b.rate === undefined ? 'measuring…' : `${b.rate >= 10 ? Math.round(b.rate) : b.rate.toFixed(1)}%/${b.perLabel}`
-              const reset = b.resetAt !== undefined ? fmtResetAt(b.resetAt, at) : ''
-              const [line, color] =
-                f.kind === 'measuring'
-                  ? ['shows once the window has moved', undefined]
-                  : f.kind === 'idle'
-                    ? [`no use lately, stays at ${Math.round(b.pct)}%`, 'green']
-                    : f.kind === 'hits'
-                      ? [`hits 100% at ${fmtResetAt(f.at, at)}${b.resetAt !== undefined ? `, ${fmtUntil(b.resetAt - f.at)} before reload` : ''}`, 'red']
-                      : [`on pace for ${Math.round(f.atReset)}% at reload ${reset}`.trim(), pctColor(f.atReset)]
-              return (
-                <Text key={`burn:${r.kind}`} wrap="truncate-end">
-                  {'  '}
-                  {(LIMIT_NAME[r.kind] ?? r.kind).padEnd(7)} <Text bold>{pace}</Text> · <Text color={color}>{line}</Text>
-                </Text>
-              )
-            })}
-          </Box>
-        )}
-      </Box>
-    )
-  })
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => report($, $.ui.resolve(e), e.surface, e.props.bodyColumns))
 
   // ---- the band above the prompt: this prompt's tokens and model ------------------------
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, prompts)
     const last = list.at(-1)
-    if (!last || e.props.hasSurvey) return next(e)
+    if (e.props.hasSurvey) return next(e)
+    if (e.surface === 'terminal') return floatingBar($, $.ui.resolve(e), e.props.bodyColumns, list, await next(e))
+    if (!last) return next(e)
     // The band is shared: what the plugins beneath draw there stays, below this row.
     const below = await next(e)
     const p = normalize(last)
@@ -733,7 +854,7 @@ export const register: Register = on => {
     const { Box, Text, Button } = ui
     const open = <Button key="usage-open" label="Usage" plain onPress={() => void togglePane($)} />
 
-    if (e.surface !== 'terminal' && 'Svg' in ui) {
+    if ('Svg' in ui) {
       const { Svg } = ui
       const W = Math.max(220, Math.min(1400, (e.props.bodyColumns || 100) * 8 - 72))
       const row = bandRow(W, p, t, elapsedMs, cost, cache)
@@ -750,28 +871,8 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" gap={1}>
-          <Text color={COLOR[p.status]}>{GLYPH[p.status]}</Text>
-          <Text bold>{mainModel ? modelName(mainModel) : '—'}</Text>
-          <Text dimColor wrap="truncate-end">
-            {mainModel}
-            {others.length ? ` +${others.join(', +')}` : ''}
-          </Text>
-          <Text>│</Text>
-          <Text bold>{fmtTokens(total(t))} tokens</Text>
-          <Text dimColor>({fmtTokens(t.output)} out)</Text>
-          <Text>│</Text>
-          <Text dimColor>
-            {fmtTime(elapsedMs)} · ≈{fmtUsd(cost)}
-          </Text>
-          {cache && (
-            <Box flexDirection="row" gap={1}>
-              <Text>│</Text>
-              <Text color={cache.isWarm ? 'cyan' : undefined} dimColor={!cache.isWarm}>
-                {cache.label}
-              </Text>
-            </Box>
-          )}
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          <Text>{alt}</Text>
           {open}
         </Box>
         {below}
